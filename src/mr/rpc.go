@@ -22,8 +22,26 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type RequestArgs struct {
+	Id int // request worker's id
+}
 
+type RegisterReply struct {
+	NReduce int
+	Id      int
+}
+
+type Job struct {
+	Kind     string
+	FileName string
+	Index    int
+}
+
+const NO_JOB string = "NO_JOB"
+const MAP_JOB string = "MAP_JOB"
+const REDUCE_JOB string = "REDUCE_JOB"
+
+// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
