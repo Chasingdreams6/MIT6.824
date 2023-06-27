@@ -63,7 +63,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			switch reply.Kind {
 			case NO_JOB:
 				{
-					fmt.Println(Id, " Get No job")
+					//fmt.Println(Id, " Get No job")
 					break
 				}
 			case MAP_JOB:
@@ -85,7 +85,7 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func doMap(job *Job, mapf func(string, string) []KeyValue) {
-	fmt.Println(strconv.Itoa(Id) + " Got map job " + job.FileName)
+	//fmt.Println(strconv.Itoa(Id) + " Got map job " + job.FileName)
 	filename := job.FileName
 	file, err := os.Open(filename)
 	if err != nil {
@@ -106,7 +106,7 @@ func doMap(job *Job, mapf func(string, string) []KeyValue) {
 		tmp[hashedKey] = append(tmp[hashedKey], v)
 	}
 	for i := 0; i < NReduce; i++ {
-		oName := "tmp-" + strconv.Itoa(Id) + "-" + strconv.Itoa(i)
+		oName := "mr-" + strconv.Itoa(Id) + "-" + strconv.Itoa(i)
 		ofile, _ := os.OpenFile(oName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		enc := json.NewEncoder(ofile)
 		for _, v := range tmp[i] {
@@ -120,7 +120,7 @@ func doMap(job *Job, mapf func(string, string) []KeyValue) {
 }
 
 func doReduce(job *Job, reducef func(string, []string) string) {
-	fmt.Println(strconv.Itoa(Id) + " Got reduce job " + strconv.Itoa(job.Index))
+	//fmt.Println(strconv.Itoa(Id) + " Got reduce job " + strconv.Itoa(job.Index))
 	pwd, _ := os.Getwd()
 	entries, _ := ioutil.ReadDir(pwd)
 	var intermediate []KeyValue
@@ -129,7 +129,7 @@ func doReduce(job *Job, reducef func(string, []string) string) {
 			continue
 		} else {
 			filename := entry.Name()
-			if strings.HasPrefix(filename, "tmp") {
+			if strings.HasPrefix(filename, "mr") {
 				strs := strings.Split(filename, "-")
 				if strs[2] == strconv.Itoa(job.Index) {
 					rfile, _ := os.Open(filename)
@@ -180,7 +180,7 @@ func Register() {
 	args := RequestArgs{}
 	ok := call("Coordinator.RegisterHandler", &args, &reply)
 	if ok {
-		fmt.Printf("Id:%d nReduce:%d\n", reply.Id, reply.NReduce)
+		//fmt.Printf("Id:%d nReduce:%d\n", reply.Id, reply.NReduce)
 		Id = reply.Id
 		NReduce = reply.NReduce
 	} else {
