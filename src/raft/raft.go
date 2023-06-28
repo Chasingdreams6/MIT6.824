@@ -342,6 +342,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) TryRequestVote(server int) {
 	rf.mu.Lock()
 	DebugOutput(dInfo, "S%d T%d start sendRV to %d", rf.me, rf.currentTerm, server)
+	term := rf.currentTerm
 	defer rf.mu.Unlock()
 	if rf.role != CANDIDATE {
 		return
@@ -364,7 +365,10 @@ func (rf *Raft) TryRequestVote(server int) {
 			rf.currentTerm = reply.Term
 			rf.ClearVoteMap()
 		}
-		if reply.VoteGranted { // got vote
+		// first check is to prove the term not changed, because line 357
+		// release the lock, the term may change, then the vote is from the
+		// last term, should not count as this term
+		if term == rf.currentTerm && reply.VoteGranted { // got vote
 			rf.gotVotesMap[server] = true
 		}
 		cnt := 0
