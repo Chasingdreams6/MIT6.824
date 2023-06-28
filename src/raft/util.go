@@ -39,6 +39,10 @@ const (
 	dWarn  logTopic = "WARN"
 	dHERT  logTopic = "LOG1"
 	dRole  logTopic = "LOG2"
+	dREPL  logTopic = "CLNT"
+	dAPPL  logTopic = "APPL"
+	dCMIT  logTopic = "CMIT"
+	dEntr  logTopic = "ENTR"
 )
 
 var debugStart time.Time

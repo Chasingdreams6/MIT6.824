@@ -96,6 +96,7 @@ type Entries struct {
 
 // return currentTerm and whether this server
 // believes it is the leader.
+// it must locked..
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
@@ -204,11 +205,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.role != FOLLOWER { // not follower, not give the vote
 		return
 	}
-	// TODO, the condition may be changed in 2B'
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		DebugOutput(dInfo, "S%d T%d grant RV to %d", rf.me, rf.currentTerm, args.CandidateId)
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId { // suitable for 2A
+		isNewer := false
+		if args.LastLogTerm > rf.log[len(rf.log)-1].Term { // laster term
+			isNewer = true
+		}
+		if args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1 { // same term but at-least-longer log
+			isNewer = true
+		}
+		if isNewer {
+			DebugOutput(dInfo, "S%d T%d grant RV to %d", rf.me, rf.currentTerm, args.CandidateId)
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+		}
 	}
 }
 
@@ -239,11 +248,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// got the hb
 	rf.lastTouchedTime = time.Now()
-	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
+
+	// part5, change commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < len(rf.log)-1 {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = len(rf.log) - 1
+		}
+		DebugOutput(dCMIT, "S%d T%d CMIT %d", rf.me, rf.currentTerm, rf.commitIndex)
+	}
+
+	// for hb
+	if len(args.Entries) == 0 { // hb, return
+		reply.Success = true
 		return
 	}
-	reply.Success = true
+
+	if len(rf.log)-1 < args.PrevLogIndex { // log is shorter
+		reply.Success = false
+		reply.Index = len(rf.log) - 1 // accelerate the speed of the decreasing of nextIndex, next should start from here
+	} else {
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // wrong match, may need former
+			reply.Success = false
+			reply.Index = args.PrevLogIndex - 1 // next RPC's entry should start from here
+			return                              // no need copy next...
+		}
+		DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex,
+			args.PrevLogIndex+len(args.Entries)-1, args.LeaderId)
+		rf.log = rf.log[:args.PrevLogIndex] // strip
+		// copy [nextIndex, index] to follower
+		for i := 0; i < len(args.Entries); i++ {
+			rf.log = append(rf.log, args.Entries[i])
+		}
+		reply.Success = true // when success, index is useless
+
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -296,6 +336,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	Index   int
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -311,12 +352,36 @@ type AppendEntriesReply struct {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
 	index := -1
-	term := -1
-	isLeader := true
-
+	term := rf.currentTerm
+	isLeader := false
+	if rf.role == LEADER {
+		isLeader = true
+	}
+	if isLeader == false { // return false
+		rf.mu.Unlock()
+		return index, term, isLeader
+	}
 	// Your code here (2B).
-
+	DebugOutput(dEntr, "S%d T%d add EnT at %d", rf.me, rf.currentTerm, len(rf.log))
+	rf.log = append(rf.log, Entries{
+		Command: command,
+		Term:    term,
+	})
+	index = len(rf.log) - 1
+	rf.mu.Unlock()
+	//// wait until commitIndex >= this index
+	//for rf.killed() == false {
+	//	rf.mu.Lock()
+	//	if rf.commitIndex >= index { // ok
+	//		DebugOutput(dInfo, "S%d T%d RTC index:%d", rf.me, rf.currentTerm, index)
+	//		break
+	//	}
+	//	rf.mu.Unlock()
+	//	ms := 25 + (rand.Int63() % 150)
+	//	time.Sleep(time.Duration(ms) * time.Millisecond)
+	//}
 	return index, term, isLeader
 }
 
@@ -377,9 +442,14 @@ func (rf *Raft) TryRequestVote(server int) {
 				cnt++
 			}
 		}
-		if cnt > 1 && cnt > (len(rf.peers)/2) { // become leader, only one node can't be leader
+		if rf.role != LEADER && cnt > 1 && cnt > (len(rf.peers)/2) { // become leader, only one node can't be leader
 			DebugOutput(dRole, "S%d become T%d leader", rf.me, rf.currentTerm)
 			rf.role = LEADER
+			// init lastIndex and matchIndex
+			for i := 0; i < len(rf.peers); i++ {
+				rf.nextIndex[i] = len(rf.log) // lastest index + 1
+				rf.matchIndex[i] = 0
+			}
 			rf.mu.Unlock()
 			// try to send hb immediately
 			for i := 0; i < len(rf.peers); i++ {
@@ -424,6 +494,69 @@ func (rf *Raft) TrySendHB(server int) {
 	}
 }
 
+func (rf *Raft) TrySendRP(server int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != LEADER {
+		return
+	}
+	lastTerm := rf.currentTerm
+	// send when index >= nextIndex
+	// TODO init nextIndex and matchedIndex
+	if len(rf.log)-1 < rf.nextIndex[server] {
+		return
+	}
+	// [nextIndex, index] is new area
+	// entry[0, index - nextIndex] is actually log[nextIndex, index] 's area
+	var tmpEntries []Entries
+	for i := rf.nextIndex[server]; i < len(rf.log); i++ {
+		tmpEntries = append(tmpEntries, rf.log[i])
+	}
+	var tmpTerm int
+	if rf.nextIndex[server] < len(rf.log) {
+		tmpTerm = rf.log[rf.nextIndex[server]].Term
+	} else {
+		tmpTerm = -1
+	}
+	DebugOutput(dREPL, "S%d T%d Send RP to %d", rf.me, rf.currentTerm, server)
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: rf.nextIndex[server],
+		PrevLogTerm:  tmpTerm,
+		Entries:      tmpEntries,
+		LeaderCommit: rf.commitIndex,
+	}
+	reply := AppendEntriesReply{}
+	rf.mu.Unlock() // release the lock, before wait
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	rf.mu.Lock()
+	if ok {
+		if reply.Term > rf.currentTerm {
+			rf.role = FOLLOWER
+			DebugOutput(dRole, "S%d T%d down to follower T%d<T%d", rf.me, rf.currentTerm, rf.currentTerm, reply.Term)
+			rf.ClearVoteMap()
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+		}
+		// check still the term
+		if rf.currentTerm == lastTerm {
+			// handle the reply value of RPC
+			if reply.Success {
+				rf.nextIndex[server] = len(rf.log)
+				rf.matchIndex[server] = len(rf.log) - 1 // all matched..
+				DebugOutput(dInfo, "S%d T%d sync ID:%d to %d", rf.me, rf.currentTerm,
+					server, len(rf.log)-1)
+			} else {
+				rf.nextIndex[server] = reply.Index // wait for next turn to send more data...
+			}
+		}
+
+	} else {
+		DebugOutput(dError, "S%d T%d SendRP to %d error", rf.me, rf.currentTerm, server)
+	}
+}
+
 // for follower's to become candidate
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
@@ -432,7 +565,7 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		rf.mu.Lock()
 		if len(rf.log) == 0 { // first, sleep
-			rf.log = append(rf.log, IdleEntry)
+			//rf.log = append(rf.log, IdleEntry)
 			rf.mu.Unlock()
 		} else {
 			if rf.IfElectionTimeout() == true { // start election, 3 roles can start election
@@ -486,6 +619,75 @@ func (rf *Raft) sendHB() {
 	}
 }
 
+func (rf *Raft) TryReplica() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		if rf.role == LEADER {
+			rf.mu.Unlock()
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me { // other
+					go rf.TrySendRP(i)
+				}
+			}
+			rf.mu.Lock()
+		}
+		rf.mu.Unlock()
+		// TODO What's the suitable replica time?
+		ms := 25 + (rand.Int63() % 150)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+func (rf *Raft) IncreaseCommitIndex() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		if rf.role == LEADER {
+			var nextIndex int
+			L := rf.commitIndex
+			R := len(rf.log) - 1
+			for nextIndex = R; nextIndex > L; nextIndex-- {
+				cnt := 0
+				for i := 0; i < len(rf.peers); i++ {
+					if rf.matchIndex[i] >= nextIndex {
+						cnt++
+					}
+				}
+				// TODO, what's the marjority?
+				if cnt*2 >= len(rf.peers) && rf.log[nextIndex].Term == rf.currentTerm {
+					DebugOutput(dCMIT, "S%d T%d LD_CMIT %d", rf.me, rf.currentTerm, nextIndex)
+					rf.commitIndex = nextIndex
+					break
+				}
+			}
+		}
+		rf.mu.Unlock()
+		// TODO What's the suitable check time?
+		ms := 25 + (rand.Int63() % 150)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+func (rf *Raft) TryApply(applyCh chan ApplyMsg) {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for rf.lastApplied < rf.commitIndex {
+			// apply rf.lastApplied+1
+			DebugOutput(dAPPL, "S%d T%d apply %d", rf.me, rf.currentTerm, rf.lastApplied+1)
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied+1].Command,
+				CommandIndex: rf.lastApplied + 1,
+			}
+			rf.lastApplied++
+			applyCh <- msg // send msg
+		}
+		rf.mu.Unlock()
+		// TODO What's the suitable check time?
+		ms := 25 + (rand.Int63() % 150)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
 func (rf *Raft) IfElectionTimeout() bool {
 	now := time.Now()
 	return now.Sub(rf.lastTouchedTime) > rf.electionTimeout
@@ -516,9 +718,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.role = FOLLOWER
+	rf.lastApplied = 0
 	for i := 0; i < len(rf.peers); i++ {
 		rf.gotVotesMap = append(rf.gotVotesMap, false)
+		rf.nextIndex = append(rf.nextIndex, 1)
+		rf.matchIndex = append(rf.matchIndex, 0)
 	}
+	rf.log = append(rf.log, IdleEntry)
 	rf.ResetElectionTimeout()
 
 	// initialize from state persisted before a crash
@@ -528,6 +734,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 	// start heartbeat goroutine, only useful for leader
 	go rf.sendHB()
-
+	// start replica goroutine, try to replica to followers
+	go rf.TryReplica()
+	// start increase commit gorountine
+	go rf.IncreaseCommitIndex()
+	// start apply goroutine
+	go rf.TryApply(applyCh)
 	return rf
 }
