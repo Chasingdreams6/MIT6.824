@@ -237,6 +237,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.Term < rf.currentTerm { // ignore
 		reply.Success = false
+		reply.Index = 1
 		return
 	}
 	if rf.role == CANDIDATE && args.LeaderId != rf.me { // down to follower
@@ -247,22 +248,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// got the hb
 	rf.lastTouchedTime = time.Now()
 
-	// part5, change commitIndex
-	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit < len(rf.log)-1 {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = len(rf.log) - 1
-		}
-		DebugOutput(dCMIT, "S%d T%d CMIT %d", rf.me, rf.currentTerm, rf.commitIndex)
-	}
-
-	// for hb
-	if len(args.Entries) == 0 { // hb, return
+	if args.LeaderId == rf.me { // send to myself, return
 		reply.Success = true
 		return
 	}
-
+	// here, not self->self
+	// may still be heartbeat or RP
 	if len(rf.log)-1 < args.PrevLogIndex { // log is shorter
 		reply.Success = false
 		reply.Index = len(rf.log) - 1 // accelerate the speed of the decreasing of nextIndex, next should start from here
@@ -272,16 +263,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Index = args.PrevLogIndex // next RPC's entry should start from here
 			return                          // no need copy next...
 		}
-		DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex+1,
-			args.PrevLogIndex+len(args.Entries), args.LeaderId)
-		rf.log = rf.log[:args.PrevLogIndex+1] // strip
-		// copy [nextIndex, index] to follower
-		for i := 0; i < len(args.Entries); i++ {
-			rf.log = append(rf.log, args.Entries[i])
+		if len(rf.log) != args.PrevLogIndex+1 {
+			rf.log = rf.log[:args.PrevLogIndex+1] // strip
+		}
+		if len(args.Entries) > 0 {
+			DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex+1,
+				args.PrevLogIndex+len(args.Entries), args.LeaderId)
+			// copy [nextIndex, index] to follower
+			for i := 0; i < len(args.Entries); i++ {
+				rf.log = append(rf.log, args.Entries[i])
+			}
 		}
 		reply.Success = true // when success, index is useless
 
+		// part5, change commitIndex, this must happen after check
+		if args.LeaderCommit > rf.commitIndex {
+			if args.LeaderCommit < len(rf.log)-1 {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = len(rf.log) - 1
+			}
+			DebugOutput(dCMIT, "S%d T%d CMIT %d", rf.me, rf.currentTerm, rf.commitIndex)
+		}
 	}
+	// never got here
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -361,7 +366,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	if isLeader == false { // return false
 		rf.mu.Unlock()
-		return index, term, isLeader
+		//DebugOutput(dInfo, "S%d T%d RTC_NLD index:%d", rf.me, rf.currentTerm, index)
+		return len(rf.log), term, isLeader
 	}
 	// Your code here (2B).
 	DebugOutput(dEntr, "S%d T%d add EnT at %d", rf.me, rf.currentTerm, len(rf.log))
@@ -371,18 +377,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	index = len(rf.log) - 1
 	rf.mu.Unlock()
-	// wait until commitIndex >= this index, or reply -1
+	// wait 10 round to see, if the leader changed.
+	// if changed, act as me is not leader
+	// if committed, there must be committed
+	// if timeout, there may be committed, may wrong.
 	ccc := 10 // at most check
 	for rf.killed() == false && ccc > 0 {
 		rf.mu.Lock()
-		if rf.commitIndex >= index { // ok
-			DebugOutput(dInfo, "S%d T%d RTC index:%d", rf.me, rf.currentTerm, index)
+		term = rf.currentTerm
+		if rf.commitIndex >= index { // must success
+			DebugOutput(dInfo, "S%d T%d RTC_SUSS index:%d", rf.me, rf.currentTerm, index)
 			rf.mu.Unlock()
-			if command != rf.log[index].Command { // something got wrong...
-				rf.log = rf.log[:index] // undo this log
-				return -1, term, isLeader
-			}
 			return index, term, isLeader
+		}
+		if rf.role != LEADER { // not leader now, fail, act as not leader before
+			DebugOutput(dInfo, "S%d T%d RTC_NLD index:%d", rf.me, rf.currentTerm, index)
+			rf.log = rf.log[:index]
+			rf.mu.Unlock()
+			return index, term, false
+		}
+		if command != rf.log[index].Command { // something got wrong...
+			rf.log = rf.log[:index] // undo this log
+			DebugOutput(dInfo, "S%d T%d RTC_WRONG index:%d", rf.me, rf.currentTerm, index)
+			rf.mu.Unlock()
+			return index, term, false
 		}
 		rf.mu.Unlock()
 		ccc--
@@ -390,9 +408,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	rf.mu.Lock()
-	rf.log = rf.log[:index]
+	term = rf.currentTerm
+	isLeader = false
+	if rf.role == LEADER {
+		isLeader = true
+	}
+	// may success, who knows?
+	DebugOutput(dInfo, "S%d T%d RTC_TOT index:%d", rf.me, rf.currentTerm, index)
 	rf.mu.Unlock()
-	return -1, term, isLeader
+	return index, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -416,12 +440,12 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) TryRequestVote(server int) {
 	rf.mu.Lock()
-	DebugOutput(dInfo, "S%d T%d start sendRV to %d", rf.me, rf.currentTerm, server)
 	term := rf.currentTerm
 	defer rf.mu.Unlock()
 	if rf.role != CANDIDATE {
 		return
 	}
+	DebugOutput(dInfo, "S%d T%d start sendRV to %d", rf.me, rf.currentTerm, server)
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -482,7 +506,7 @@ func (rf *Raft) TrySendHB(server int) {
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm, // should prove it's leader's term
 		LeaderId:     rf.me,
-		PrevLogIndex: len(rf.log) - 1, // TODO
+		PrevLogIndex: len(rf.log) - 1,
 		PrevLogTerm:  rf.log[len(rf.log)-1].Term,
 		Entries:      []Entries{},
 		LeaderCommit: rf.commitIndex,
@@ -514,12 +538,8 @@ func (rf *Raft) TrySendRP(server int) {
 		return
 	}
 	lastTerm := rf.currentTerm
-	// send when index >= nextIndex
-	// TODO init nextIndex and matchedIndex
-	if len(rf.log)-1 < rf.nextIndex[server] {
-		return
-	}
 	// [nextIndex, index] is new area
+	// nextIndex may larger than index, which means entries are empty, just for check
 	// entry[0, index - nextIndex] is actually log[nextIndex, index] 's area
 	var tmpEntries []Entries
 	for i := rf.nextIndex[server]; i < len(rf.log); i++ {
@@ -528,7 +548,8 @@ func (rf *Raft) TrySendRP(server int) {
 	var tmpTerm int
 	if rf.nextIndex[server]-1 < len(rf.log) {
 		tmpTerm = rf.log[rf.nextIndex[server]-1].Term
-	} else {
+	} else { // TODO can't happen?
+		DebugOutput(dError, "S%d T%d Bad happen", rf.me, rf.currentTerm)
 		tmpTerm = -1
 	}
 	DebugOutput(dREPL, "S%d T%d Send RP to %d", rf.me, rf.currentTerm, server)
@@ -667,7 +688,7 @@ func (rf *Raft) IncreaseCommitIndex() {
 					}
 				}
 				// TODO, what's the marjority?
-				if cnt*2 >= len(rf.peers) && rf.log[nextIndex].Term == rf.currentTerm {
+				if cnt*2 >= len(rf.peers)-1 && rf.log[nextIndex].Term == rf.currentTerm {
 					DebugOutput(dCMIT, "S%d T%d LD_CMIT %d", rf.me, rf.currentTerm, nextIndex)
 					rf.commitIndex = nextIndex
 					break
