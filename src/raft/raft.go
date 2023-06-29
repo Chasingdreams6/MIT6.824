@@ -255,15 +255,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// here, not self->self
 	// may still be heartbeat or RP
 	if len(rf.log)-1 < args.PrevLogIndex { // log is shorter
+		DebugOutput(dInfo, "S%d T%d shorter(%d) than LD%d(%d)", rf.me, rf.currentTerm,
+			len(rf.log)-1, args.LeaderId, args.PrevLogIndex)
 		reply.Success = false
-		reply.Index = len(rf.log) - 1 // accelerate the speed of the decreasing of nextIndex, next should start from here
+		reply.Index = len(rf.log) // accelerate the speed of the decreasing of nextIndex, next should start from here
 	} else {
 		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // wrong match, may need former
 			reply.Success = false
 			reply.Index = args.PrevLogIndex // next RPC's entry should start from here
-			return                          // no need copy next...
+			DebugOutput(dInfo, "S%d T%d diff(%d) from LD %d(%d) at %d", rf.me, rf.currentTerm,
+				rf.log[args.PrevLogIndex].Term, args.LeaderId, args.PrevLogTerm, args.PrevLogIndex)
+			return // no need copy next...
 		}
-		if len(rf.log) != args.PrevLogIndex+1 {
+		if len(rf.log) > args.PrevLogIndex+1 {
 			rf.log = rf.log[:args.PrevLogIndex+1] // strip
 		}
 		if len(args.Entries) > 0 {
@@ -381,7 +385,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// if changed, act as me is not leader
 	// if committed, there must be committed
 	// if timeout, there may be committed, may wrong.
-	ccc := 10 // at most check
+	// TODO
+	// this version is best-effort, but is too slow..
+	// the question is, if we don't wait, we must prove
+	// the msg can be commit finally (even if the leader changed)
+	//
+	ccc := 1 // at most check
 	for rf.killed() == false && ccc > 0 {
 		rf.mu.Lock()
 		term = rf.currentTerm
