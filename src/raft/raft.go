@@ -23,7 +23,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
@@ -223,7 +222,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 // AppendEntries caller send hb to callee
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// TODO
 	rf.mu.Lock()
 	DebugOutput(dHERT, "S%d got AE from %d", rf.me, args.LeaderId)
 	defer rf.mu.Unlock()
@@ -271,12 +269,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // wrong match, may need former
 			reply.Success = false
-			reply.Index = args.PrevLogIndex - 1 // next RPC's entry should start from here
-			return                              // no need copy next...
+			reply.Index = args.PrevLogIndex // next RPC's entry should start from here
+			return                          // no need copy next...
 		}
-		DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex,
-			args.PrevLogIndex+len(args.Entries)-1, args.LeaderId)
-		rf.log = rf.log[:args.PrevLogIndex] // strip
+		DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex+1,
+			args.PrevLogIndex+len(args.Entries), args.LeaderId)
+		rf.log = rf.log[:args.PrevLogIndex+1] // strip
 		// copy [nextIndex, index] to follower
 		for i := 0; i < len(args.Entries); i++ {
 			rf.log = append(rf.log, args.Entries[i])
@@ -315,11 +313,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	//DebugOutput(dSIZE, "S%d ->%d Size:%d %d", rf.me, server, unsafe.Sizeof(*args), unsafe.Sizeof(*reply))
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	//DebugOutput(dSIZE, "S%d ->%d Size:%d %d", rf.me, server, unsafe.Sizeof(*args), unsafe.Sizeof(*reply))
 	return ok
 }
 
@@ -336,7 +336,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-	Index   int
+	Index   int // extra field for reduce rpc's number
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -371,18 +371,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	index = len(rf.log) - 1
 	rf.mu.Unlock()
-	//// wait until commitIndex >= this index
-	//for rf.killed() == false {
-	//	rf.mu.Lock()
-	//	if rf.commitIndex >= index { // ok
-	//		DebugOutput(dInfo, "S%d T%d RTC index:%d", rf.me, rf.currentTerm, index)
-	//		break
-	//	}
-	//	rf.mu.Unlock()
-	//	ms := 25 + (rand.Int63() % 150)
-	//	time.Sleep(time.Duration(ms) * time.Millisecond)
-	//}
-	return index, term, isLeader
+	// wait until commitIndex >= this index, or reply -1
+	ccc := 10 // at most check
+	for rf.killed() == false && ccc > 0 {
+		rf.mu.Lock()
+		if rf.commitIndex >= index { // ok
+			DebugOutput(dInfo, "S%d T%d RTC index:%d", rf.me, rf.currentTerm, index)
+			rf.mu.Unlock()
+			if command != rf.log[index].Command { // something got wrong...
+				rf.log = rf.log[:index] // undo this log
+				return -1, term, isLeader
+			}
+			return index, term, isLeader
+		}
+		rf.mu.Unlock()
+		ccc--
+		ms := 25 + (rand.Int63() % 150)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+	rf.mu.Lock()
+	rf.log = rf.log[:index]
+	rf.mu.Unlock()
+	return -1, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -500,6 +510,9 @@ func (rf *Raft) TrySendRP(server int) {
 	if rf.role != LEADER {
 		return
 	}
+	if rf.matchIndex[server] == len(rf.log)-1 { // all matched, no need to sync
+		return
+	}
 	lastTerm := rf.currentTerm
 	// send when index >= nextIndex
 	// TODO init nextIndex and matchedIndex
@@ -513,8 +526,8 @@ func (rf *Raft) TrySendRP(server int) {
 		tmpEntries = append(tmpEntries, rf.log[i])
 	}
 	var tmpTerm int
-	if rf.nextIndex[server] < len(rf.log) {
-		tmpTerm = rf.log[rf.nextIndex[server]].Term
+	if rf.nextIndex[server]-1 < len(rf.log) {
+		tmpTerm = rf.log[rf.nextIndex[server]-1].Term
 	} else {
 		tmpTerm = -1
 	}
@@ -522,7 +535,7 @@ func (rf *Raft) TrySendRP(server int) {
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: rf.nextIndex[server],
+		PrevLogIndex: rf.nextIndex[server] - 1,
 		PrevLogTerm:  tmpTerm,
 		Entries:      tmpEntries,
 		LeaderCommit: rf.commitIndex,
@@ -614,6 +627,7 @@ func (rf *Raft) sendHB() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable hb time?
+		// [25, 200]
 		ms := 25 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -693,8 +707,15 @@ func (rf *Raft) IfElectionTimeout() bool {
 	return now.Sub(rf.lastTouchedTime) > rf.electionTimeout
 }
 
+// special condition:
+// there may be a condition, leader's commitIndex increased, the log replicated, but the nextHB not come
+// to the followers, causing the follower's commitIndex not increased. Then one of the followers become
+// leader, which cause the nextLeader's commitIndex < lastLeader's commitIndex
+// the leader can't increase it's commitIndex until next whole round RP and IncreaseCommitIndex...
+// The simply solution is, let electionTimeout much longer, which is enough to send and receive next
+// HB, to let follower's commitIndex increase.
 func (rf *Raft) ResetElectionTimeout() {
-	ms := 150 + (rand.Int63() % 150) // [150, 300)
+	ms := 300 + (rand.Int63() % 150) // [300, 450)
 	rf.electionTimeout = time.Duration(ms) * time.Millisecond
 }
 

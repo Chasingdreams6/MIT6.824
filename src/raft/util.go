@@ -43,6 +43,7 @@ const (
 	dAPPL  logTopic = "APPL"
 	dCMIT  logTopic = "CMIT"
 	dEntr  logTopic = "ENTR"
+	dSIZE  logTopic = "SIZE"
 )
 
 var debugStart time.Time
