@@ -262,26 +262,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // wrong match, may need former
 			reply.Success = false
-			reply.Index = args.PrevLogIndex // next RPC's entry should start from here
-			DebugOutput(dInfo, "S%d T%d diff(%d) from LD %d(%d) at %d", rf.me, rf.currentTerm,
-				rf.log[args.PrevLogIndex].Term, args.LeaderId, args.PrevLogTerm, args.PrevLogIndex)
+			reply.Index = args.PrevLogIndex // next RPC's entry should start from here, at least 1
+			for reply.Index > 1 {
+				if rf.log[reply.Index].Term == rf.log[args.PrevLogIndex].Term {
+					reply.Index--
+				}
+			}
+			DebugOutput(dInfo, "S%d T%d diff(%d) from LD %d(%d) at %d, Index->%d", rf.me, rf.currentTerm,
+				rf.log[args.PrevLogIndex].Term, args.LeaderId, args.PrevLogTerm, args.PrevLogIndex, reply.Index)
 			return // no need copy next...
 		}
-		if len(rf.log) > args.PrevLogIndex+1 {
-			rf.log = rf.log[:args.PrevLogIndex+1] // strip
-			DebugOutput(dInfo, "S%d T%d stripped to [:%d]", rf.me, rf.currentTerm, args.PrevLogIndex+1)
-		}
-		if len(args.Entries) > 0 {
-			DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex+1,
-				args.PrevLogIndex+len(args.Entries), args.LeaderId)
-			// copy [nextIndex, index] to follower
-			for i := 0; i < len(args.Entries); i++ {
-				rf.log = append(rf.log, args.Entries[i])
+		// defend got an old heartbeat
+		if args.IsHearBeat != true {
+			if len(rf.log) > args.PrevLogIndex+1 {
+				rf.log = rf.log[:args.PrevLogIndex+1] // strip
+				DebugOutput(dInfo, "S%d T%d stripped to [:%d]", rf.me, rf.currentTerm, args.PrevLogIndex+1)
+			}
+			if len(args.Entries) > 0 {
+				DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex+1,
+					args.PrevLogIndex+len(args.Entries), args.LeaderId)
+				// copy [nextIndex, index] to follower
+				for i := 0; i < len(args.Entries); i++ {
+					rf.log = append(rf.log, args.Entries[i])
+				}
 			}
 		}
+
 		reply.Success = true // when success, index is useless
 
 		// part5, change commitIndex, this must happen after check
+		// heatbeat can also check
 		if args.LeaderCommit > rf.commitIndex {
 			if args.LeaderCommit < len(rf.log)-1 {
 				rf.commitIndex = args.LeaderCommit
@@ -333,6 +343,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendTryApply(server int, args *TryApplyArgs, reply *TryApplyReply) bool {
+	ok := rf.peers[server].Call("Raft.TryApplyEntry", args, reply)
+	return ok
+}
+
 // use Capital letters
 type AppendEntriesArgs struct {
 	Term         int
@@ -341,12 +356,85 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int
 	Entries      []Entries // entries, empty for hb
 	LeaderCommit int
+	IsHearBeat   bool
 }
 
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
 	Index   int // extra field for reduce rpc's number
+}
+
+type TryApplyArgs struct {
+	Index      int
+	Command    interface{}
+	LastLeader int
+}
+
+type TryApplyReply struct {
+	SuccessChan chan bool
+}
+
+func (rf *Raft) TryApplyEntry(args *TryApplyArgs, reply *TryApplyReply) {
+	// wait sometime for execute
+	ms := 50 + (rand.Int63() % 50)
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+
+	rf.mu.Lock()
+
+	if rf.role == LEADER { // is LeaderNow, try to apply this
+
+		// when a request is resend here...
+		newReply := TryApplyReply{}
+		newArgs := *args
+		newArgs.LastLeader = rf.me
+		reply.SuccessChan <- true     // ok
+		if args.LastLeader == rf.me { // no change
+			if rf.commitIndex >= args.Index { // succeed
+				DebugOutput(dInfo, "S%d T%d RTC_SUSS(%v) index:%d", rf.me, rf.currentTerm,
+					args.Command, args.Index)
+				rf.mu.Unlock()
+				return
+			}
+		} else { // changed, reset the msg
+			if len(rf.log)-1 >= args.Index && rf.commitIndex < args.Index { // exist before, change and reset
+				rf.log[args.Index] = Entries{
+					Command: args.Command,
+					Term:    rf.currentTerm,
+				}
+				for i := 0; i < len(rf.peers); i++ { // flush
+					rf.matchIndex[i] = 0
+					rf.nextIndex[i] = len(rf.log)
+				}
+				DebugOutput(dEntr, "S%d(LD) T%d replace EnT(%v) at %d", rf.me, rf.currentTerm, args.Command, args.Index)
+			} else { // append
+				rf.log = append(rf.log, Entries{
+					Command: args.Command,
+					Term:    rf.currentTerm,
+				})
+				DebugOutput(dEntr, "S%d(LD) T%d add EnT(%v) at %d", rf.me, rf.currentTerm, args.Command, args.Index)
+			}
+		}
+		go rf.TryApplyEntry(&newArgs, &newReply)
+		//go rf.sendTryApply(rf.me, &newArgs, &newReply)
+		rf.mu.Unlock()
+		return
+	} else { // change to other, this part can't exist circle
+		// TODO what if the round's signal, all failed?
+		// Then this entry may lost, but it's very rare
+		// may can send until reply is true, which means found a leader..
+		if args.LastLeader != -2 {
+			for i := 0; i < len(rf.peers); i++ {
+				newArgs := TryApplyArgs{Index: args.Index, Command: args.Command, LastLeader: -2}
+				newReply := TryApplyReply{}
+				go rf.sendTryApply(i, &newArgs, &newReply)
+			}
+		}
+		//reply.Success = false
+		rf.mu.Unlock()
+		return // exit
+	}
+	// never reach here
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -376,57 +464,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 	// Your code here (2B).
-	DebugOutput(dEntr, "S%d T%d add EnT(%v) at %d", rf.me, rf.currentTerm, command, len(rf.log))
-	rf.log = append(rf.log, Entries{
-		Command: command,
-		Term:    term,
-	})
+	rf.log = append(rf.log, Entries{Command: command, Term: rf.currentTerm})
 	index = len(rf.log) - 1
-	rf.mu.Unlock()
-	// wait 10 round to see, if the leader changed.
-	// if changed, act as me is not leader
-	// if committed, there must be committed
-	// if timeout, there may be committed, may wrong.
-	// TODO
-	// this version is best-effort, but is too slow..
-	// the question is, if we don't wait, we must prove
-	// the msg can be commit finally (even if the leader changed)
-	// if timeout, we can't prove this, since message is lost
-	// no one restart this msg.
-	ccc := 6 // at most check
-	for rf.killed() == false && ccc > 0 {
-		rf.mu.Lock()
-		term = rf.currentTerm
-		if rf.commitIndex >= index { // must success
-			DebugOutput(dInfo, "S%d T%d RTC_SUSS index:%d", rf.me, rf.currentTerm, index)
-			rf.mu.Unlock()
-			return index, term, isLeader
-		}
-		if rf.role != LEADER { // not leader now, fail, act as not leader before
-			DebugOutput(dInfo, "S%d T%d RTC_NLD index:%d", rf.me, rf.currentTerm, index)
-			rf.log = rf.log[:index]
-			rf.mu.Unlock()
-			return index, term, false
-		}
-		if command != rf.log[index].Command { // something got wrong...
-			rf.log = rf.log[:index] // undo this log
-			DebugOutput(dInfo, "S%d T%d RTC_WRONG index:%d", rf.me, rf.currentTerm, index)
-			rf.mu.Unlock()
-			return index, term, false
-		}
-		rf.mu.Unlock()
-		ccc--
-		ms := 25 + (rand.Int63() % 25)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-	rf.mu.Lock()
-	term = rf.currentTerm
-	isLeader = false
-	if rf.role == LEADER {
-		isLeader = true
-	}
-	// may success, who knows?
-	DebugOutput(dInfo, "S%d T%d RTC_TOT index:%d", rf.me, rf.currentTerm, index)
+	DebugOutput(dEntr, "S%d(LD) T%d add(out) EnT(%v) at %d", rf.me, rf.currentTerm, command, index)
+	args := TryApplyArgs{Index: index, Command: command, LastLeader: rf.me}
+	reply := TryApplyReply{}
+	go rf.TryApplyEntry(&args, &reply)
+	//go rf.sendTryApply(rf.me, &args, &reply)
 	rf.mu.Unlock()
 	return index, term, isLeader
 }
@@ -522,6 +566,7 @@ func (rf *Raft) TrySendHB(server int) {
 		PrevLogTerm:  rf.log[len(rf.log)-1].Term,
 		Entries:      []Entries{},
 		LeaderCommit: rf.commitIndex,
+		IsHearBeat:   true,
 	}
 	reply := AppendEntriesReply{}
 	rf.mu.Unlock() // release the lock, before wait
@@ -572,6 +617,7 @@ func (rf *Raft) TrySendRP(server int) {
 		PrevLogTerm:  tmpTerm,
 		Entries:      tmpEntries,
 		LeaderCommit: rf.commitIndex,
+		IsHearBeat:   false,
 	}
 	reply := AppendEntriesReply{}
 	rf.mu.Unlock() // release the lock, before wait
@@ -662,7 +708,7 @@ func (rf *Raft) sendHB() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable hb time?
-		ms := 400 + (rand.Int63() % 100)
+		ms := 200 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -749,7 +795,7 @@ func (rf *Raft) IfElectionTimeout() bool {
 // The simply solution is, let electionTimeout much longer, which is enough to send and receive next
 // HB, to let follower's commitIndex increase.
 func (rf *Raft) ResetElectionTimeout() {
-	ms := 800 + (rand.Int63() % 150)
+	ms := 400 + (rand.Int63() % 150)
 	rf.electionTimeout = time.Duration(ms) * time.Millisecond
 }
 
