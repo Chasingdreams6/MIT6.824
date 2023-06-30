@@ -269,6 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if len(rf.log) > args.PrevLogIndex+1 {
 			rf.log = rf.log[:args.PrevLogIndex+1] // strip
+			DebugOutput(dInfo, "S%d T%d stripped to [:%d]", rf.me, rf.currentTerm, args.PrevLogIndex+1)
 		}
 		if len(args.Entries) > 0 {
 			DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.currentTerm, args.PrevLogIndex+1,
@@ -369,12 +370,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = true
 	}
 	if isLeader == false { // return false
+		index = len(rf.log) + 1
 		rf.mu.Unlock()
 		//DebugOutput(dInfo, "S%d T%d RTC_NLD index:%d", rf.me, rf.currentTerm, index)
-		return len(rf.log), term, isLeader
+		return index, term, isLeader
 	}
 	// Your code here (2B).
-	DebugOutput(dEntr, "S%d T%d add EnT at %d", rf.me, rf.currentTerm, len(rf.log))
+	DebugOutput(dEntr, "S%d T%d add EnT(%v) at %d", rf.me, rf.currentTerm, command, len(rf.log))
 	rf.log = append(rf.log, Entries{
 		Command: command,
 		Term:    term,
@@ -389,8 +391,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// this version is best-effort, but is too slow..
 	// the question is, if we don't wait, we must prove
 	// the msg can be commit finally (even if the leader changed)
-	//
-	ccc := 1 // at most check
+	// if timeout, we can't prove this, since message is lost
+	// no one restart this msg.
+	ccc := 6 // at most check
 	for rf.killed() == false && ccc > 0 {
 		rf.mu.Lock()
 		term = rf.currentTerm
@@ -413,7 +416,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		rf.mu.Unlock()
 		ccc--
-		ms := 25 + (rand.Int63() % 150)
+		ms := 25 + (rand.Int63() % 25)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	rf.mu.Lock()
@@ -586,12 +589,14 @@ func (rf *Raft) TrySendRP(server int) {
 		if rf.currentTerm == lastTerm {
 			// handle the reply value of RPC
 			if reply.Success {
+				DebugOutput(dInfo, "S%d T%d sync ID:%d to [%d,%d]", rf.me, rf.currentTerm,
+					server, args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 				rf.nextIndex[server] = len(rf.log)
 				rf.matchIndex[server] = len(rf.log) - 1 // all matched..
-				DebugOutput(dInfo, "S%d T%d sync ID:%d to %d", rf.me, rf.currentTerm,
-					server, len(rf.log)-1)
 			} else {
 				rf.nextIndex[server] = reply.Index // wait for next turn to send more data...
+				DebugOutput(dInfo, "S%d T%d no_sync Id:%d at %d, nIx=%d", rf.me, rf.currentTerm,
+					server, args.PrevLogIndex, reply.Index)
 			}
 		}
 
@@ -657,8 +662,7 @@ func (rf *Raft) sendHB() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable hb time?
-		// [25, 200]
-		ms := 25 + (rand.Int63() % 150)
+		ms := 400 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -677,7 +681,7 @@ func (rf *Raft) TryReplica() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable replica time?
-		ms := 25 + (rand.Int63() % 150)
+		ms := 400 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -745,7 +749,7 @@ func (rf *Raft) IfElectionTimeout() bool {
 // The simply solution is, let electionTimeout much longer, which is enough to send and receive next
 // HB, to let follower's commitIndex increase.
 func (rf *Raft) ResetElectionTimeout() {
-	ms := 300 + (rand.Int63() % 150) // [300, 450)
+	ms := 800 + (rand.Int63() % 150)
 	rf.electionTimeout = time.Duration(ms) * time.Millisecond
 }
 
@@ -780,7 +784,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	time.Sleep(10 * time.Millisecond)
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	// start heartbeat goroutine, only useful for leader
