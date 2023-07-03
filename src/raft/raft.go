@@ -150,7 +150,7 @@ func (rf *Raft) persist() {
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	//DebugOutput(dRLOG, "S%d RLOG", rf.me)
+	DebugOutput(dRLOG, "S%d RLOG", rf.me)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -289,7 +289,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // AppendEntries caller send hb to callee
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	DebugOutput(dHERT, "S%d got AE from %d", rf.me, args.LeaderId)
+	DebugOutput(dHERT, "S%d T%d got AE(T:%d) from %d", rf.me, rf.CurrentTerm, args.Term, args.LeaderId)
 	defer rf.mu.Unlock()
 	reply.Term = rf.CurrentTerm
 	// rule 2 for all servers
@@ -311,11 +311,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DebugOutput(dRole, "S%d T%d down to follower L%d", rf.me, rf.CurrentTerm, args.LeaderId)
 		rf.Role = FOLLOWER
 		rf.ClearVoteMap()
+		rf.VoteFor = -1
 	}
 	// got the hb
 	rf.lastTouchedTime = time.Now()
 
 	if args.LeaderId == rf.me { // send to myself, return
+		DebugOutput(dInfo, "S%d T%d got my_self_AE(%d), ret", rf.me, rf.CurrentTerm, args.Term)
 		reply.Success = true
 		rf.persist()
 		return
@@ -327,6 +329,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			len(rf.Log)-1, args.LeaderId, args.PrevLogIndex)
 		reply.Success = false
 		reply.Index = len(rf.Log) // accelerate the speed of the decreasing of nextIndex, next should start from here
+		rf.persist()
+		return
 	} else {
 		if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm { // wrong match, may need former
 			reply.Success = false
@@ -366,7 +370,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		rf.persist()
+		return
 	}
+	DebugOutput(dError, "S%d T%d NEVER GOT HERE!!!!", rf.me, rf.CurrentTerm)
 	// never got here
 }
 
@@ -554,6 +560,7 @@ func (rf *Raft) TryRequestVote(server int) {
 			DebugOutput(dRole, "S%d T%d down to follower T%d<T%d", rf.me, rf.CurrentTerm, rf.CurrentTerm, reply.Term)
 			rf.CurrentTerm = reply.Term
 			rf.ClearVoteMap()
+			rf.VoteFor = -1
 		}
 		// first check is to prove the term not changed, because line 357
 		// release the lock, the term may change, then the vote is from the
@@ -575,6 +582,7 @@ func (rf *Raft) TryRequestVote(server int) {
 				rf.nextIndex[i] = len(rf.Log) // lastest index + 1
 				rf.matchIndex[i] = 0
 			}
+			rf.persist() // add here for concurrent bug?
 			rf.mu.Unlock()
 			// try to send hb immediately
 			for i := 0; i < len(rf.peers); i++ {
@@ -584,7 +592,7 @@ func (rf *Raft) TryRequestVote(server int) {
 		}
 		rf.persist() // TODO, may have concurrent bugs?
 	} else {
-		DebugOutput(dError, "S%d SendRV to %d error", rf.me, server)
+		DebugOutput(dError, "S%d T%d SendRV to %d error", rf.me, rf.CurrentTerm, server)
 	}
 }
 
@@ -617,7 +625,7 @@ func (rf *Raft) TrySendHB(server int) {
 			rf.persist()
 		}
 	} else {
-		DebugOutput(dError, "S%d T%d SendHB to %d error", rf.me, rf.CurrentTerm, server)
+		DebugOutput(dError, "S%d T%d SendHB(atT%d) to %d error", rf.me, rf.CurrentTerm, args.Term, server)
 	}
 }
 
@@ -676,6 +684,24 @@ func (rf *Raft) TrySendRP(server int) {
 					server, args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 				rf.nextIndex[server] = len(rf.Log)
 				rf.matchIndex[server] = len(rf.Log) - 1 // all matched..
+				// TODO, immediately update leader's commitIndex here
+				// then still commit even leader will soon changed.
+				// this can also solve leader's change problem?
+				var cnt = 0
+				var nextIndex = rf.matchIndex[server]
+				if nextIndex > rf.commitIndex { // try to increase commitIndex
+					for i := 0; i < len(rf.peers); i++ {
+						if i != rf.me && rf.matchIndex[i] >= nextIndex {
+							cnt++
+						}
+					}
+					// TODO, what's the marjority?
+					if cnt*2 >= len(rf.peers)-1 && rf.Log[nextIndex].Term == rf.CurrentTerm {
+						DebugOutput(dCMIT, "S%d T%d LD_CMIT %d", rf.me, rf.CurrentTerm, nextIndex)
+						rf.commitIndex = nextIndex
+					}
+				}
+
 			} else {
 				rf.nextIndex[server] = reply.Index // wait for next turn to send more data...
 				DebugOutput(dInfo, "S%d T%d no_sync Id:%d at %d, nIx=%d", rf.me, rf.CurrentTerm,
@@ -684,7 +710,7 @@ func (rf *Raft) TrySendRP(server int) {
 		}
 		rf.persist()
 	} else {
-		DebugOutput(dError, "S%d T%d SendRP to %d error", rf.me, rf.CurrentTerm, server)
+		DebugOutput(dError, "S%d T%d SendRP(atT%d) to %d error", rf.me, rf.CurrentTerm, args.Term, server)
 	}
 }
 
@@ -876,7 +902,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start replica goroutine, try to replica to followers
 	go rf.TryReplica()
 	// start increase commit gorountine
-	go rf.IncreaseCommitIndex()
+	//go rf.IncreaseCommitIndex()
 	// start apply goroutine
 	go rf.TryApply(applyCh)
 	return rf
