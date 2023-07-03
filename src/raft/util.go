@@ -44,6 +44,8 @@ const (
 	dCMIT  logTopic = "CMIT"
 	dEntr  logTopic = "ENTR"
 	dSIZE  logTopic = "SIZE"
+	dWLOG  logTopic = "WLOG"
+	dRLOG  logTopic = "RLOG"
 )
 
 var debugStart time.Time

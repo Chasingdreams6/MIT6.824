@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -127,10 +129,28 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	DebugOutput(dWLOG, "S%d T%d L%d WLOG", rf.me, rf.CurrentTerm, len(rf.Log))
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VoteFor)
+	var LogLen int
+	LogLen = len(rf.Log)
+	e.Encode(LogLen)
+	for _, entry := range rf.Log {
+		e.Encode(entry)
+	}
+	e.Encode(rf.Role)
+	for _, val := range rf.GotVotesMap {
+		e.Encode(val)
+	}
+	state := w.Bytes()
+	rf.persister.Save(state, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+	//DebugOutput(dRLOG, "S%d RLOG", rf.me)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -147,6 +167,48 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var curTerm int
+	var voteFor int
+	var Role Role
+	var Log []Entries
+	var GotVotedMap []bool
+	var leng int
+	if d.Decode(&curTerm) != nil || d.Decode(&voteFor) != nil {
+		DebugOutput(dError, "Read Error!")
+	} else {
+		rf.CurrentTerm = curTerm
+		rf.VoteFor = voteFor
+	}
+	if d.Decode(&leng) != nil {
+		DebugOutput(dError, "Read Error!")
+	} else {
+		for i := 0; i < leng; i++ {
+			var entry Entries
+			if d.Decode(&entry) != nil {
+				DebugOutput(dError, "Read Error!")
+			} else {
+				Log = append(Log, entry)
+			}
+		}
+		rf.Log = Log
+	}
+	if d.Decode(&Role) != nil {
+		DebugOutput(dError, "Read Error!")
+	} else {
+		rf.Role = Role
+	}
+	for i := 0; i < len(rf.peers); i++ {
+		var val bool
+		if d.Decode(&val) != nil {
+			DebugOutput(dError, "Read Error!")
+		} else {
+			GotVotedMap = append(GotVotedMap, val)
+		}
+	}
+	rf.GotVotesMap = GotVotedMap
+	DebugOutput(dRLOG, "S%d T%d L%d END_RLOG", rf.me, rf.CurrentTerm, len(rf.Log))
 }
 
 // the service says it has created a snapshot that has
@@ -200,9 +262,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < rf.CurrentTerm { // ignore...
 		reply.VoteGranted = false
+		rf.persist() // commit point
 		return
 	}
 	if rf.Role != FOLLOWER { // not follower, not give the vote
+		rf.persist()
 		return
 	}
 	if rf.VoteFor == -1 || rf.VoteFor == args.CandidateId { // suitable for 2A
@@ -219,6 +283,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.VoteFor = args.CandidateId
 		}
 	}
+	rf.persist()
 }
 
 // AppendEntries caller send hb to callee
@@ -239,6 +304,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.CurrentTerm { // ignore
 		reply.Success = false
 		reply.Index = 1
+		rf.persist()
 		return
 	}
 	if rf.Role == CANDIDATE && args.LeaderId != rf.me { // down to follower
@@ -251,6 +317,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderId == rf.me { // send to myself, return
 		reply.Success = true
+		rf.persist()
 		return
 	}
 	// here, not self->self
@@ -271,6 +338,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			DebugOutput(dInfo, "S%d T%d diff(%d) from LD %d(%d) at %d", rf.me, rf.CurrentTerm,
 				rf.Log[args.PrevLogIndex].Term, args.LeaderId, args.PrevLogTerm, args.PrevLogIndex)
+			rf.persist()
 			return // no need copy next...
 		}
 		if len(rf.Log) > args.PrevLogIndex+1 {
@@ -296,6 +364,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			DebugOutput(dCMIT, "S%d T%d CMIT %d", rf.me, rf.CurrentTerm, rf.commitIndex)
 		}
+
+		rf.persist()
 	}
 	// never got here
 }
@@ -388,6 +458,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 	})
 	index = len(rf.Log) - 1
+	rf.persist()
 	rf.mu.Unlock()
 	// wait 10 round to see, if the leader changed.
 	// if changed, act as me is not leader
@@ -511,6 +582,7 @@ func (rf *Raft) TryRequestVote(server int) {
 			}
 			rf.mu.Lock() // reget the lock
 		}
+		rf.persist() // TODO, may have concurrent bugs?
 	} else {
 		DebugOutput(dError, "S%d SendRV to %d error", rf.me, server)
 	}
@@ -542,6 +614,7 @@ func (rf *Raft) TrySendHB(server int) {
 			rf.ClearVoteMap()
 			rf.CurrentTerm = reply.Term
 			rf.VoteFor = -1
+			rf.persist()
 		}
 	} else {
 		DebugOutput(dError, "S%d T%d SendHB to %d error", rf.me, rf.CurrentTerm, server)
@@ -609,7 +682,7 @@ func (rf *Raft) TrySendRP(server int) {
 					server, args.PrevLogIndex, reply.Index)
 			}
 		}
-
+		rf.persist()
 	} else {
 		DebugOutput(dError, "S%d T%d SendRP to %d error", rf.me, rf.CurrentTerm, server)
 	}
@@ -641,6 +714,7 @@ func (rf *Raft) ticker() {
 				rf.lastTouchedTime = time.Now()
 				rf.ResetElectionTimeout()
 				// send RPCs to all other servers
+				rf.persist()
 				rf.mu.Unlock()
 				for i := 0; i < len(rf.peers); i++ {
 					if i == rf.me {
