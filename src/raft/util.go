@@ -46,6 +46,8 @@ const (
 	dSIZE  logTopic = "SIZE"
 	dWLOG  logTopic = "WLOG"
 	dRLOG  logTopic = "RLOG"
+	dLOCK  logTopic = "RLCK"
+	dULCK  logTopic = "ULCK"
 )
 
 var debugStart time.Time
@@ -58,6 +60,16 @@ func init() {
 }
 
 func DebugOutput(topic logTopic, format string, a ...interface{}) {
+	if topic == dLOCK || topic == dULCK {
+		if debugVerbosity >= 2 {
+			time := time.Since(debugStart).Microseconds()
+			time /= 100
+			prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+			format = prefix + format
+			log.Printf(format, a...)
+		}
+		return
+	}
 	if debugVerbosity >= 1 {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
@@ -65,6 +77,7 @@ func DebugOutput(topic logTopic, format string, a ...interface{}) {
 		format = prefix + format
 		log.Printf(format, a...)
 	}
+
 }
 
 func DebugExample() {
