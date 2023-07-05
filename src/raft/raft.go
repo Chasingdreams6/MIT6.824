@@ -62,11 +62,14 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	// persistent states
-	CurrentTerm int
-	VoteFor     int
-	Log         []Entries
-	Role        Role
-	GotVotesMap []bool
+	CurrentTerm       int
+	VoteFor           int
+	Log               []Entries
+	Role              Role
+	GotVotesMap       []bool
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	SnapshotSaved     []byte
 	// volatile state for all servers
 	commitIndex     int
 	lastApplied     int
@@ -76,6 +79,8 @@ type Raft struct {
 	// volatile state for leaders
 	nextIndex  []int
 	matchIndex []int
+	// chan for 2D
+	ApplyChan chan ApplyMsg
 }
 
 type Role string
@@ -144,8 +149,11 @@ func (rf *Raft) persist() {
 	for _, val := range rf.GotVotesMap {
 		e.Encode(val)
 	}
+	// encoding something for 2d
+	e.Encode(rf.LastIncludedIndex)
+	e.Encode(rf.LastIncludedTerm)
 	state := w.Bytes()
-	rf.persister.Save(state, nil)
+	rf.persister.Save(state, rf.SnapshotSaved)
 }
 
 // restore previously persisted state.
@@ -208,6 +216,19 @@ func (rf *Raft) readPersist(data []byte) {
 		}
 	}
 	rf.GotVotesMap = GotVotedMap
+	var lt, li int
+	if d.Decode(&li) != nil || d.Decode(&lt) != nil {
+		DebugOutput(dError, "Read Error!")
+	} else {
+		rf.LastIncludedIndex = li
+		rf.LastIncludedTerm = lt
+	}
+	if rf.persister.SnapshotSize() > 0 {
+		rf.SnapshotSaved = rf.persister.ReadSnapshot() // restore the snapshot
+	} else {
+		rf.SnapshotSaved = nil
+	}
+
 	DebugOutput(dRLOG, "S%d T%d L%d END_RLOG", rf.me, rf.CurrentTerm, len(rf.Log))
 }
 
@@ -215,8 +236,57 @@ func (rf *Raft) readPersist(data []byte) {
 // all info up to and including index. this means the
 // service no longer needs the Log through (and including)
 // that index. Raft should now trim its Log as much as possible.
+
+// we can discard the log after index, the remaining would be [index + 1, ...)
+// the snapshot is from the upper layer, containing the service's snapshot.
+// raft should save the snapshot correctly, and can be read when applyCh (sending...)
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	if index < rf.LastIncludedIndex { // old snapshot
+		DebugOutput(dLOCK, "S%d T%d OLd MakeSnapshot request %d<%d", rf.me, rf.CurrentTerm,
+			index, rf.LastIncludedIndex)
+		rf.mu.Unlock()
+		return
+	}
+	DebugOutput(dLOCK, "S%d T%d MakeSnapshot at index %d", rf.me, rf.CurrentTerm, index)
+
+	// TODO, strip the Log
+	// [x, n] in Log is logically mapped the area [LastIncludedIndex + x, n + LastIncludedIndex]
+	// x start from 1,
+	lastStart := rf.MapIndexToPhysical(index)
+	rf.LastIncludedTerm = rf.Log[lastStart].Term
+	tmp := rf.Log[lastStart+1:]
+	New := rf.Log[:1]
+	New = append(New, tmp...)
+	rf.Log = New
+	rf.LastIncludedIndex = index
+	rf.SnapshotSaved = snapshot
+	DebugOutput(dInfo, "S%d T%d remapped Log[%d:](ac:[%d:]) bI:%d l:%d", rf.me, rf.CurrentTerm,
+		lastStart+1, index, rf.LastIncludedIndex+1, len(rf.Log))
+	rf.persist() // TODO, should persist here?
+	// reset the nextIndex and matchIndex because the change of log
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = len(rf.Log) // lastest index + 1
+		rf.matchIndex[i] = 0
+	}
+	if rf.lastApplied < rf.LastIncludedIndex {
+		DebugOutput(dAPPL, "S%d T%d apply SS Si:%d ST:%d", rf.me, rf.CurrentTerm,
+			rf.LastIncludedIndex, rf.LastIncludedTerm)
+		msg := ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      rf.SnapshotSaved,
+			SnapshotIndex: rf.LastIncludedIndex,
+			SnapshotTerm:  rf.LastIncludedTerm,
+		}
+		rf.lastApplied = rf.LastIncludedIndex
+		rf.mu.Unlock()
+		rf.ApplyChan <- msg // send msg, need a thread?
+	} else {
+		DebugOutput(dAPPL, "S%d T%d SS Si:%d(<=%d) ST:%d no need to apply", rf.me, rf.CurrentTerm,
+			rf.LastIncludedIndex, rf.lastApplied, rf.LastIncludedTerm)
+		rf.mu.Unlock()
+	}
 
 }
 
@@ -226,7 +296,7 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
 	CandidateId  int
-	LastLogIndex int
+	LastLogIndex int // max index between snapshot and log
 	LastLogTerm  int
 }
 
@@ -242,6 +312,30 @@ func (rf *Raft) ClearVoteMap() {
 	for i := 0; i < len(rf.peers); i++ {
 		rf.GotVotesMap[i] = false
 	}
+}
+
+// must use in lock
+func (rf *Raft) MapIndexToLogical(x int) int {
+	return x + rf.LastIncludedIndex
+}
+
+// must use in lock
+func (rf *Raft) MapIndexToPhysical(x int) int {
+	return x - rf.LastIncludedIndex
+}
+
+func MinInt(x int, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}
+
+func MaxInt(x int, y int) int {
+	if x > y {
+		return x
+	}
+	return y
 }
 
 // example RequestVote RPC handler.
@@ -271,12 +365,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.mu.Unlock()
 		return
 	}
+	var lastTerm, lastIndex int
+	if len(rf.Log) > 0 {
+		lastTerm = rf.Log[len(rf.Log)-1].Term
+		lastIndex = rf.MapIndexToLogical(len(rf.Log) - 1)
+	}
+	if rf.LastIncludedTerm > lastTerm { // will occur?
+		lastTerm = rf.LastIncludedTerm
+		lastIndex = rf.LastIncludedIndex
+	}
+	//lastTerm = MaxInt(lastTerm, rf.LastIncludedTerm)
 	if rf.VoteFor == -1 || rf.VoteFor == args.CandidateId { // suitable for 2A
 		isNewer := false
-		if args.LastLogTerm > rf.Log[len(rf.Log)-1].Term { // later term
+		if args.LastLogTerm > lastTerm { // later term
 			isNewer = true
 		}
-		if args.LastLogTerm == rf.Log[len(rf.Log)-1].Term && args.LastLogIndex >= len(rf.Log)-1 { // same term but at-least-longer Log
+		if args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex { // same term but at-least-longer Log
 			isNewer = true
 		}
 		if isNewer {
@@ -328,6 +432,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// here, not self->self
 	// may still be heartbeat or RP
+	// TODO, we assume the RP only sync the log area
+	// TODO, then the snapshot area is sync by InstallSnapShotRPC
 	if len(rf.Log)-1 < args.PrevLogIndex { // Log is shorter
 		DebugOutput(dInfo, "S%d T%d shorter(%d) than LD%d(%d)", rf.me, rf.CurrentTerm,
 			len(rf.Log)-1, args.LeaderId, args.PrevLogIndex)
@@ -351,27 +457,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.mu.Unlock()
 			return // no need copy next...
 		}
-		if len(rf.Log) > args.PrevLogIndex+1 {
-			rf.Log = rf.Log[:args.PrevLogIndex+1] // strip
-			DebugOutput(dInfo, "S%d T%d stripped to [:%d)", rf.me, rf.CurrentTerm, args.PrevLogIndex+1)
+		if len(rf.Log) > args.PrevLogIndex+1+args.LastIncludedIndex {
+			rf.Log = rf.Log[:args.PrevLogIndex+1+args.LastIncludedIndex] // strip
+			DebugOutput(dInfo, "S%d T%d stripped to [:%d)", rf.me, rf.CurrentTerm, args.PrevLogIndex+1+args.LastIncludedIndex)
 			rf.persist()
 		}
 		if len(args.Entries) > 0 {
-			DebugOutput(dInfo, "S%d T%d copy[%d,%d] from %d", rf.me, rf.CurrentTerm, args.PrevLogIndex+1,
-				args.PrevLogIndex+len(args.Entries), args.LeaderId)
+			// TODO, should only append a part
+			DebugOutput(dInfo, "S%d T%d copy[%d,%d]([%d,%d]) from %d", rf.me, rf.CurrentTerm, args.PrevLogIndex+1,
+				args.PrevLogIndex+len(args.Entries), rf.MapIndexToLogical(args.PrevLogIndex+1),
+				rf.MapIndexToLogical(args.PrevLogIndex+len(args.Entries)), args.LeaderId)
 			// copy [nextIndex, index] to follower
 			for i := 0; i < len(args.Entries); i++ {
-				rf.Log = append(rf.Log, args.Entries[i])
+				ActualIndex := args.PrevLogIndex + 1 + i
+				if ActualIndex >= len(rf.Log) { // only append the last part.
+					rf.Log = append(rf.Log, args.Entries[i])
+				}
 			}
+			DebugOutput(dInfo, "S%d T%d Now Log len=%d SI:%d", rf.me, rf.CurrentTerm, len(rf.Log), rf.LastIncludedIndex)
 			rf.persist()
 		}
 		reply.Success = true // when success, index is useless
 		// part5, change commitIndex, this must happen after check
 		if args.LeaderCommit > rf.commitIndex {
-			if args.LeaderCommit < len(rf.Log)-1 {
+			if args.LeaderCommit < len(rf.Log)-1+rf.LastIncludedIndex {
 				rf.commitIndex = args.LeaderCommit
 			} else {
-				rf.commitIndex = len(rf.Log) - 1
+				rf.commitIndex = len(rf.Log) - 1 + rf.LastIncludedIndex
 			}
 			DebugOutput(dCMIT, "S%d T%d CMIT %d", rf.me, rf.CurrentTerm, rf.commitIndex)
 		}
@@ -380,6 +492,57 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	DebugOutput(dError, "S%d T%d NEVER GOT HERE!!!!", rf.me, rf.CurrentTerm)
 	// never got here
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	reply.Term = rf.CurrentTerm
+	if args.Term < rf.CurrentTerm { // ignore
+		rf.mu.Unlock()
+		return
+	}
+	if args.LastIncludedIndex <= rf.lastApplied { // shorter,no apply
+		DebugOutput(dInfo, "S%d T%d Si(%d)<=(%d) St:%d, no replace and apply", rf.me, rf.CurrentTerm,
+			args.LastIncludedIndex, rf.lastApplied, args.LastIncludedTerm)
+		rf.mu.Unlock()
+		return
+	}
+	if args.LastIncludedIndex == rf.LastIncludedIndex && args.LastIncludedTerm == rf.LastIncludedTerm {
+		DebugOutput(dULCK, "S%d T%d SameSnapShot with LD%d Id:%d Tm:%d",
+			rf.me, rf.CurrentTerm, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
+		rf.mu.Unlock()
+		return
+	}
+	DebugOutput(dULCK, "S%d T%d Install from LD%d Id:%d Tm:%d", rf.me, rf.CurrentTerm, args.LeaderId,
+		args.LastIncludedIndex, args.LastIncludedTerm)
+	// copied from snapshot
+	lastStart := rf.MapIndexToPhysical(args.LastIncludedIndex)
+	if lastStart <= len(rf.Log)-1 { // replace the prefix, leave the suffix
+		tmp := rf.Log[lastStart+1:]
+		New := rf.Log[:1]
+		New = append(New, tmp...)
+		rf.Log = New
+	} else { // simply throw all logs, waiting for an InstallRPC
+		rf.Log = rf.Log[:1]
+		DebugOutput(dInfo, "S%d T%d Clean ALl logs", rf.me, rf.CurrentTerm)
+	}
+	rf.LastIncludedIndex = args.LastIncludedIndex
+	rf.LastIncludedTerm = args.LastIncludedTerm
+	rf.SnapshotSaved = args.SnapshotData
+	DebugOutput(dInfo, "S%d T%d remapped Log bI:%d l:%d", rf.me, rf.CurrentTerm, rf.LastIncludedIndex+1, len(rf.Log))
+	rf.persist()
+	// change the last applied
+	rf.commitIndex = MaxInt(rf.commitIndex, rf.LastIncludedIndex)
+	rf.lastApplied = rf.LastIncludedIndex
+	// send msg..
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.SnapshotSaved,
+		SnapshotIndex: rf.LastIncludedIndex,
+		SnapshotTerm:  rf.LastIncludedTerm,
+	}
+	rf.mu.Unlock()
+	rf.ApplyChan <- msg // send msg, need a thread?
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -420,20 +583,38 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 // use Capital letters
 type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []Entries // entries, empty for hb
-	LeaderCommit int
+	Term              int
+	LeaderId          int
+	PrevLogIndex      int
+	PrevLogTerm       int
+	Entries           []Entries // entries, empty for hb
+	LeaderCommit      int
+	LastIncludedIndex int
 }
 
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
 	Index   int // extra field for reduce rpc's number
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	SnapshotData      []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -463,12 +644,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 	// Your code here (2B).
-	DebugOutput(dEntr, "S%d T%d add EnT(%v) at %d", rf.me, rf.CurrentTerm, command, len(rf.Log))
+	DebugOutput(dEntr, "S%d T%d add EnT(%v) at %d(ac:%d)", rf.me, rf.CurrentTerm,
+		command, len(rf.Log), len(rf.Log)+rf.LastIncludedIndex)
 	rf.Log = append(rf.Log, Entries{
 		Command: command,
 		Term:    term,
 	})
-	index = len(rf.Log) - 1
+	index = len(rf.Log) - 1 + rf.LastIncludedIndex
 	rf.persist()
 	rf.mu.Unlock()
 	// wait 10 round to see, if the leader changed.
@@ -553,11 +735,23 @@ func (rf *Raft) TryRequestVote(sentTerm int, server int) {
 		return
 	}
 	DebugOutput(dInfo, "S%d T%d start sendRV to %d", rf.me, rf.CurrentTerm, server)
+	lastIndex := -1
+	lastTerm := -1
+	if len(rf.Log) > 0 {
+		lastIndex = len(rf.Log) - 1
+		lastTerm = rf.Log[len(rf.Log)-1].Term
+	}
+	if rf.SnapshotSaved != nil {
+		if rf.LastIncludedTerm > lastTerm {
+			lastTerm = rf.LastIncludedTerm
+			lastIndex = rf.LastIncludedIndex
+		}
+	}
 	args := RequestVoteArgs{
 		Term:         rf.CurrentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.Log) - 1,
-		LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
+		LastLogIndex: lastIndex,
+		LastLogTerm:  lastTerm,
 	}
 	reply := RequestVoteReply{}
 	rf.mu.Unlock()
@@ -622,12 +816,13 @@ func (rf *Raft) TrySendHB(term int, server int) {
 	}
 	DebugOutput(dHERT, "S%d T%d SendHB to %d", rf.me, rf.CurrentTerm, server)
 	args := AppendEntriesArgs{
-		Term:         rf.CurrentTerm, // should prove it's leader's term
-		LeaderId:     rf.me,
-		PrevLogIndex: len(rf.Log) - 1,
-		PrevLogTerm:  rf.Log[len(rf.Log)-1].Term,
-		Entries:      []Entries{},
-		LeaderCommit: rf.commitIndex,
+		Term:              rf.CurrentTerm, // should prove it's leader's term
+		LeaderId:          rf.me,
+		PrevLogIndex:      len(rf.Log) - 1,
+		PrevLogTerm:       rf.Log[len(rf.Log)-1].Term,
+		Entries:           []Entries{},
+		LeaderCommit:      rf.commitIndex,
+		LastIncludedIndex: rf.LastIncludedIndex,
 	}
 	reply := AppendEntriesReply{}
 	rf.mu.Unlock() // release the lock, before wait
@@ -645,6 +840,38 @@ func (rf *Raft) TrySendHB(term int, server int) {
 		rf.mu.Unlock()
 	} else {
 		DebugOutput(dError, "S%d SendHB(atT%d) to %d error", rf.me, args.Term, server)
+	}
+}
+
+func (rf *Raft) TrySyncSnapshot(server int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.Role != LEADER || rf.SnapshotSaved == nil { // not send now..
+		return
+	}
+	args := InstallSnapshotArgs{
+		Term:              rf.CurrentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.LastIncludedIndex,
+		LastIncludedTerm:  rf.LastIncludedTerm,
+		SnapshotData:      rf.SnapshotSaved,
+	}
+	reply := InstallSnapshotReply{}
+	rf.mu.Unlock()
+	ok := rf.sendInstallSnapshot(server, &args, &reply)
+	rf.mu.Lock()
+	if ok {
+		if reply.Term > rf.CurrentTerm { // handle term reply
+			rf.Role = FOLLOWER
+			DebugOutput(dRole, "S%d T%d down to follower T%d<T%d", rf.me, rf.CurrentTerm, rf.CurrentTerm, reply.Term)
+			rf.ClearVoteMap()
+			rf.CurrentTerm = reply.Term
+			rf.VoteFor = -1
+			rf.persist()
+		}
+	} else {
+		DebugOutput(dError, "S%d T%d SendSS(atT%d) to %d error", rf.me, rf.CurrentTerm, args.Term,
+			server)
 	}
 }
 
@@ -681,12 +908,13 @@ func (rf *Raft) TrySendRP(sentTerm int, server int) {
 	}
 	DebugOutput(dREPL, "S%d T%d Send RP to %d", rf.me, rf.CurrentTerm, server)
 	args := AppendEntriesArgs{
-		Term:         rf.CurrentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: rf.nextIndex[server] - 1,
-		PrevLogTerm:  tmpTerm,
-		Entries:      tmpEntries,
-		LeaderCommit: rf.commitIndex,
+		Term:              rf.CurrentTerm,
+		LeaderId:          rf.me,
+		PrevLogIndex:      rf.nextIndex[server] - 1,
+		PrevLogTerm:       tmpTerm,
+		Entries:           tmpEntries,
+		LeaderCommit:      rf.commitIndex,
+		LastIncludedIndex: rf.LastIncludedIndex,
 	}
 	reply := AppendEntriesReply{}
 	rf.mu.Unlock() // release the lock, before wait
@@ -715,7 +943,7 @@ func (rf *Raft) TrySendRP(sentTerm int, server int) {
 				// this can also solve leader's change problem?
 				var cnt = 0
 				var nextIndex = rf.matchIndex[server]
-				if nextIndex > rf.commitIndex { // try to increase commitIndex
+				if nextIndex+rf.LastIncludedIndex > rf.commitIndex { // try to increase commitIndex
 					for i := 0; i < len(rf.peers); i++ {
 						if i != rf.me && rf.matchIndex[i] >= nextIndex {
 							cnt++
@@ -723,8 +951,9 @@ func (rf *Raft) TrySendRP(sentTerm int, server int) {
 					}
 					// TODO, what's the marjority?
 					if cnt*2 >= len(rf.peers)-1 && rf.Log[nextIndex].Term == rf.CurrentTerm {
-						DebugOutput(dCMIT, "S%d T%d LD_CMIT %d", rf.me, rf.CurrentTerm, nextIndex)
-						rf.commitIndex = nextIndex
+						DebugOutput(dCMIT, "S%d T%d LD_CMIT %d(ac:%d)", rf.me, rf.CurrentTerm, nextIndex,
+							nextIndex+rf.LastIncludedIndex)
+						rf.commitIndex = nextIndex + rf.LastIncludedIndex
 					}
 				}
 
@@ -827,76 +1056,110 @@ func (rf *Raft) TryReplica() {
 	}
 }
 
-func (rf *Raft) IncreaseCommitIndex() {
+func (rf *Raft) SyncSnapshot() {
 	for rf.killed() == false {
 		rf.mu.Lock()
-		DebugOutput(dLOCK, "S%d T%d lck", rf.me, rf.CurrentTerm)
 		if rf.Role == LEADER {
-			var nextIndex int
-			L := rf.commitIndex
-			R := len(rf.Log) - 1
-			for nextIndex = R; nextIndex > L; nextIndex-- {
-				cnt := 0
+			if rf.SnapshotSaved != nil { // have snapshot, try to sync
 				for i := 0; i < len(rf.peers); i++ {
-					if i != rf.me && rf.matchIndex[i] >= nextIndex {
-						cnt++
+					if i != rf.me {
+						go rf.TrySyncSnapshot(i)
 					}
-				}
-				// TODO, what's the marjority?
-				if cnt*2 >= len(rf.peers)-1 && rf.Log[nextIndex].Term == rf.CurrentTerm {
-					DebugOutput(dCMIT, "S%d T%d LD_CMIT %d", rf.me, rf.CurrentTerm, nextIndex)
-					rf.commitIndex = nextIndex
-					break
 				}
 			}
 		}
-		DebugOutput(dULCK, "S%d T%d uck", rf.me, rf.CurrentTerm)
 		rf.mu.Unlock()
-		// TODO What's the suitable check time?
-		ms := 25 + (rand.Int63() % 150)
+		// TODO What's the suitable sync snapshot time?
+		ms := 2000 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
+
+// deprecated
+//func (rf *Raft) IncreaseCommitIndex() {
+//	for rf.killed() == false {
+//		rf.mu.Lock()
+//		DebugOutput(dLOCK, "S%d T%d lck", rf.me, rf.CurrentTerm)
+//		if rf.Role == LEADER {
+//			var nextIndex int
+//			L := rf.commitIndex
+//			R := len(rf.Log) - 1
+//			for nextIndex = R; nextIndex > L; nextIndex-- {
+//				cnt := 0
+//				for i := 0; i < len(rf.peers); i++ {
+//					if i != rf.me && rf.matchIndex[i] >= nextIndex {
+//						cnt++
+//					}
+//				}
+//				// TODO, what's the marjority?
+//				if cnt*2 >= len(rf.peers)-1 && rf.Log[nextIndex].Term == rf.CurrentTerm {
+//					DebugOutput(dCMIT, "S%d T%d LD_CMIT %d", rf.me, rf.CurrentTerm, nextIndex)
+//					rf.commitIndex = nextIndex
+//					break
+//				}
+//			}
+//		}
+//		DebugOutput(dULCK, "S%d T%d uck", rf.me, rf.CurrentTerm)
+//		rf.mu.Unlock()
+//		// TODO What's the suitable check time?
+//		ms := 25 + (rand.Int63() % 150)
+//		time.Sleep(time.Duration(ms) * time.Millisecond)
+//	}
+//}
+//
+//func (rf *Raft) TryApplySnapShot(applyCh chan ApplyMsg) {
+//	lastIndex := -1
+//	for rf.killed() == false {
+//		rf.mu.Lock()
+//		if rf.SnapshotSaved != nil && rf.LastIncludedIndex > lastIndex {
+//			DebugOutput(dAPPL, "S%d T%d apply SS Si:%d ST:%d", rf.me, rf.CurrentTerm,
+//				rf.LastIncludedIndex, rf.LastIncludedTerm)
+//			msg := ApplyMsg{
+//				SnapshotValid: true,
+//				Snapshot:      rf.SnapshotSaved,
+//				SnapshotIndex: rf.LastIncludedIndex,
+//				SnapshotTerm:  rf.LastIncludedTerm,
+//			}
+//			lastIndex = rf.LastIncludedIndex
+//			rf.lastApplied = rf.LastIncludedIndex
+//			rf.mu.Unlock()
+//			applyCh <- msg // send msg
+//		} else {
+//			rf.mu.Unlock()
+//		}
+//		ms := 400 + (rand.Int63() % 150)
+//		time.Sleep(time.Duration(ms) * time.Millisecond)
+//	}
+//}
 
 func (rf *Raft) TryApply(applyCh chan ApplyMsg) {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		for rf.lastApplied < rf.commitIndex {
-			DebugOutput(dAPPL, "S%d T%d apply %d", rf.me, rf.CurrentTerm, rf.lastApplied+1)
+			DebugOutput(dInfo, "S%d T%d try apply command %d", rf.me, rf.CurrentTerm, rf.lastApplied+1)
+			index := rf.lastApplied + 1
+			index = rf.MapIndexToPhysical(index)
+			if rf.lastApplied+1 > rf.LastIncludedIndex {
+				DebugOutput(dAPPL, "S%d T%d apply command at %d(ac:%d)", rf.me, rf.CurrentTerm,
+					index, rf.lastApplied+1)
+			} else {
+				DebugOutput(dAPPL, "S%d T%d command at %d(ac:%d) already in SS", rf.me, rf.CurrentTerm,
+					index, rf.lastApplied+1)
+			}
 			msg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.Log[rf.lastApplied+1].Command,
+				Command:      rf.Log[index].Command,
 				CommandIndex: rf.lastApplied + 1,
 			}
 			rf.lastApplied++
+			rf.mu.Unlock() // must unlock here, because may cause snapshot
 			applyCh <- msg // send msg
+			rf.mu.Lock()
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable check time?
-		ms := 400 + (rand.Int63() % 150)
+		ms := 50 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-}
-
-func (rf *Raft) Breaker() {
-	// release the lock, if not get lock 200 times...
-	limit := 200
-	cur := limit
-	for rf.killed() == false {
-		res := rf.mu.TryLock()
-		if res { // success
-			cur = limit
-			rf.mu.Unlock()
-		} else {
-			cur--
-			if cur == 0 {
-				cur = limit
-				// may be race...
-				DebugOutput(dError, "S%d T%d Fatal! Unexpected Out For Starving", rf.me, rf.CurrentTerm)
-				rf.mu.Unlock() // release the lock....
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -944,6 +1207,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex = append(rf.matchIndex, 0)
 	}
 	rf.Log = append(rf.Log, IdleEntry)
+	// init for 2d
+	rf.LastIncludedIndex = 0
+	rf.LastIncludedTerm = IdleEntry.Term
+	rf.SnapshotSaved = nil
+	rf.ApplyChan = applyCh
 	rf.ResetElectionTimeout()
 
 	// initialize from state persisted before a crash
@@ -955,10 +1223,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.sendHB()
 	// start replica goroutine, try to replica to followers
 	go rf.TryReplica()
+	// start sync snapshot goroutine
+	go rf.SyncSnapshot()
 	// start increase commit gorountine
 	//go rf.IncreaseCommitIndex()
-	// start apply goroutine
+	// start apply cmd goroutine
 	go rf.TryApply(applyCh)
+	// start apply snapshot go-routine
+	//	go rf.TryApplySnapShot(applyCh)
 	//go rf.Breaker()
 	return rf
 }
