@@ -228,8 +228,10 @@ func (rf *Raft) readPersist(data []byte) {
 	} else {
 		rf.SnapshotSaved = nil
 	}
-
-	DebugOutput(dRLOG, "S%d T%d L%d END_RLOG", rf.me, rf.CurrentTerm, len(rf.Log))
+	rf.lastApplied = rf.LastIncludedIndex
+	DebugOutput(dRLOG, "S%d T%d L%d END_RLOG Si:%d ST:%d", rf.me, rf.CurrentTerm, len(rf.Log),
+		rf.LastIncludedIndex,
+		rf.LastIncludedTerm)
 }
 
 // the service says it has created a snapshot that has
@@ -392,7 +394,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			DebugOutput(dInfo, "S%d T%d grant RV to %d", rf.me, rf.CurrentTerm, args.CandidateId)
 			reply.VoteGranted = true
 			rf.VoteFor = args.CandidateId
-			//rf.lastTouchedTime = time.Now()
+			rf.lastTouchedTime = time.Now()
 		}
 	}
 	rf.persist()
@@ -435,13 +437,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.mu.Unlock()
 		return
 	}
+	if args.LastIncludedIndex < rf.LastIncludedIndex { // append request from a older snapshot, ignore it
+		DebugOutput(dInfo, "S%d T%d got AE from oldSS(%d<%d), skip", args.LastIncludedIndex,
+			rf.LastIncludedIndex)
+		reply.Success = true
+		rf.mu.Unlock()
+		return
+	}
 	// here, not self->self
 	// may still be heartbeat or RP
 	// TODO, we assume the RP only sync the log area
 	// TODO, then the snapshot area is sync by InstallSnapShotRPC
-	if len(rf.Log)-1 < args.PrevLogIndex { // Log is shorter
-		DebugOutput(dInfo, "S%d T%d shorter(%d) than LD%d(%d)", rf.me, rf.CurrentTerm,
-			len(rf.Log)-1, args.LeaderId, args.PrevLogIndex)
+	// TODO, we found that a old-version snapshot may become leader,
+	// TODO and will try to append log...
+	if rf.MapIndexToLogical(len(rf.Log)-1) < args.PrevLogIndex+args.LastIncludedIndex { // Log is shorter
+		DebugOutput(dInfo, "S%d T%d shorter(%d(ac:%d)) than LD%d(%d(ac%d))", rf.me, rf.CurrentTerm,
+			len(rf.Log)-1, rf.MapIndexToLogical(len(rf.Log)-1),
+			args.LeaderId, args.PrevLogIndex, args.PrevLogIndex+args.LastIncludedIndex)
 		reply.Index = len(rf.Log) // accelerate the speed of the decreasing of nextIndex, next should start from here
 		reply.Success = false
 		rf.mu.Unlock()
@@ -1082,7 +1094,7 @@ func (rf *Raft) SyncSnapshot() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable sync snapshot time?
-		ms := 200 + (rand.Int63() % 150)
+		ms := 100 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
