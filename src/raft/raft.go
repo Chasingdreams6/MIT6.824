@@ -229,6 +229,12 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.SnapshotSaved = nil
 	}
 	rf.lastApplied = rf.LastIncludedIndex
+	if rf.Role == LEADER { // down, need to re-election
+		DebugOutput(dRole, "S%d T%d down to follower", rf.me, rf.CurrentTerm)
+		rf.Role = FOLLOWER
+		rf.ClearVoteMap()
+		rf.VoteFor = -1
+	}
 	DebugOutput(dRLOG, "S%d T%d L%d END_RLOG Si:%d ST:%d", rf.me, rf.CurrentTerm, len(rf.Log),
 		rf.LastIncludedIndex,
 		rf.LastIncludedTerm)
@@ -446,10 +452,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// here, not self->self
 	// may still be heartbeat or RP
-	// TODO, we assume the RP only sync the log area
-	// TODO, then the snapshot area is sync by InstallSnapShotRPC
-	// TODO, we found that a old-version snapshot may become leader,
-	// TODO and will try to append log...
+	// we assume the RP only sync the log area
+	// then the snapshot area is sync by InstallSnapShotRPC
+	// we found that a old-version snapshot may become leader,
+	// and will try to append log...
 	if rf.MapIndexToLogical(len(rf.Log)-1) < args.PrevLogIndex+args.LastIncludedIndex { // Log is shorter
 		DebugOutput(dInfo, "S%d T%d shorter(%d(ac:%d)) than LD%d(%d(ac%d))", rf.me, rf.CurrentTerm,
 			len(rf.Log)-1, rf.MapIndexToLogical(len(rf.Log)-1),
@@ -926,9 +932,11 @@ func (rf *Raft) TrySendRP(sentTerm int, server int) {
 	lastLen := len(rf.Log)
 	if rf.nextIndex[server]-1 < len(rf.Log) {
 		tmpTerm = rf.Log[rf.nextIndex[server]-1].Term
-	} else { // TODO can't happen?
-		DebugOutput(dError, "S%d T%d Bad happen", rf.me, rf.CurrentTerm)
-		tmpTerm = -1
+	} else { // can happen because of log's strip, will simply skip it
+		DebugOutput(dError, "S%d T%d NextIndex(%d) too old, change to %d",
+			rf.me, rf.CurrentTerm, rf.nextIndex[server], len(rf.Log))
+		rf.nextIndex[server] = len(rf.Log)
+		tmpTerm = rf.Log[rf.nextIndex[server]-1].Term
 	}
 	DebugOutput(dREPL, "S%d T%d Send RP to %d", rf.me, rf.CurrentTerm, server)
 	args := AppendEntriesArgs{
@@ -1057,7 +1065,7 @@ func (rf *Raft) sendHB() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable hb time?
-		ms := 400 + (rand.Int63() % 100)
+		ms := 200 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
