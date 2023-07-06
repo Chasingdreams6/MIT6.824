@@ -77,8 +77,9 @@ type Raft struct {
 	lastTouchedTime time.Time
 
 	// volatile state for leaders
-	nextIndex  []int
-	matchIndex []int
+	lastCommunicateTime time.Time // for leader to down..
+	nextIndex           []int
+	matchIndex          []int
 	// chan for 2D
 	ApplyChan chan ApplyMsg
 }
@@ -332,13 +333,6 @@ func (rf *Raft) MapIndexToPhysical(x int) int {
 	return x - rf.LastIncludedIndex
 }
 
-func MinInt(x int, y int) int {
-	if x < y {
-		return x
-	}
-	return y
-}
-
 func MaxInt(x int, y int) int {
 	if x > y {
 		return x
@@ -546,6 +540,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	DebugOutput(dULCK, "S%d T%d Install from LD%d Id:%d Tm:%d", rf.me, rf.CurrentTerm, args.LeaderId,
 		args.LastIncludedIndex, args.LastIncludedTerm)
 	// copied from snapshot
+	rf.lastTouchedTime = time.Now()
 	lastStart := rf.MapIndexToPhysical(args.LastIncludedIndex)
 	if lastStart <= len(rf.Log)-1 { // replace the prefix, leave the suffix
 		tmp := rf.Log[lastStart+1:]
@@ -571,8 +566,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: rf.LastIncludedIndex,
 		SnapshotTerm:  rf.LastIncludedTerm,
 	}
+	rf.ApplyChan <- msg // can use thread here, because we must prove the order of apply command...
 	rf.mu.Unlock()
-	rf.ApplyChan <- msg // send msg, need a thread?
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -673,6 +668,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		//DebugOutput(dInfo, "S%d T%d RTC_NLD index:%d", rf.me, rf.CurrentTerm, index)
 		return index, term, isLeader
 	}
+	if rf.IfLastCommunicationTimeout() {
+		DebugOutput(dRole, "S%d T%d not leader because isolation",
+			rf.me, rf.CurrentTerm)
+		return index, term, false
+	}
 	// Your code here (2B).
 	DebugOutput(dEntr, "S%d T%d add EnT(%v) at %d(ac:%d)", rf.me, rf.CurrentTerm,
 		command, len(rf.Log), len(rf.Log)+rf.LastIncludedIndex)
@@ -683,53 +683,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.Log) - 1 + rf.LastIncludedIndex
 	rf.persist()
 	rf.mu.Unlock()
-	// wait 10 round to see, if the leader changed.
-	// if changed, act as me is not leader
-	// if committed, there must be committed
-	// if timeout, there may be committed, may wrong.
-	// TODO
-	// this version is best-effort, but is too slow..
-	// the question is, if we don't wait, we must prove
-	// the msg can be commit finally (even if the leader changed)
-	// if timeout, we can't prove this, since message is lost
-	// no one restart this msg.
-	// TODO, maybe we can prove leader won't change?
-	// TODO which can be done by suitable heartbeat timeout
-	//ccc := 6 // at most check
-	//for rf.killed() == false && ccc > 0 {
-	//	rf.mu.Lock()
-	//	term = rf.CurrentTerm
-	//	if rf.commitIndex >= index { // must success
-	//		DebugOutput(dInfo, "S%d T%d RTC_SUSS index:%d", rf.me, rf.CurrentTerm, index)
-	//		rf.mu.Unlock()
-	//		return index, term, isLeader
-	//	}
-	//	if rf.Role != LEADER { // not leader now, fail, act as not leader before
-	//		DebugOutput(dInfo, "S%d T%d RTC_NLD index:%d", rf.me, rf.CurrentTerm, index)
-	//		rf.Log = rf.Log[:index]
-	//		rf.mu.Unlock()
-	//		return index, term, false
-	//	}
-	//	if command != rf.Log[index].Command { // something got wrong...
-	//		rf.Log = rf.Log[:index] // undo this Log
-	//		DebugOutput(dInfo, "S%d T%d RTC_WRONG index:%d", rf.me, rf.CurrentTerm, index)
-	//		rf.mu.Unlock()
-	//		return index, term, false
-	//	}
-	//	rf.mu.Unlock()
-	//	ccc--
-	//	ms := 25 + (rand.Int63() % 25)
-	//	time.Sleep(time.Duration(ms) * time.Millisecond)
-	//}
-	//rf.mu.Lock()
-	//term = rf.CurrentTerm
-	//isLeader = false
-	//if rf.Role == LEADER {
-	//	isLeader = true
-	//}
-	//// may success, who knows?
-	//DebugOutput(dInfo, "S%d T%d RTC_TOT index:%d", rf.me, rf.CurrentTerm, index)
-	//rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -797,6 +750,7 @@ func (rf *Raft) TryRequestVote(sentTerm int, server int) {
 			rf.VoteFor = -1
 			rf.persist()
 		}
+		rf.lastCommunicateTime = time.Now()
 		// first check is to prove the term not changed, because line 357
 		// release the lock, the term may change, then the vote is from the
 		// last term, should not count as this term
@@ -867,6 +821,9 @@ func (rf *Raft) TrySendHB(term int, server int) {
 			rf.VoteFor = -1
 			rf.persist()
 		}
+		if server != rf.me {
+			rf.lastCommunicateTime = time.Now()
+		}
 		rf.mu.Unlock()
 	} else {
 		DebugOutput(dError, "S%d SendHB(atT%d) to %d error", rf.me, args.Term, server)
@@ -875,8 +832,8 @@ func (rf *Raft) TrySendHB(term int, server int) {
 
 func (rf *Raft) TrySyncSnapshot(server int) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.Role != LEADER || rf.SnapshotSaved == nil { // not send now..
+		rf.mu.Unlock()
 		return
 	}
 	args := InstallSnapshotArgs{
@@ -889,8 +846,8 @@ func (rf *Raft) TrySyncSnapshot(server int) {
 	reply := InstallSnapshotReply{}
 	rf.mu.Unlock()
 	ok := rf.sendInstallSnapshot(server, &args, &reply)
-	rf.mu.Lock()
 	if ok {
+		rf.mu.Lock()
 		if reply.Term > rf.CurrentTerm { // handle term reply
 			rf.Role = FOLLOWER
 			DebugOutput(dRole, "S%d T%d down to follower T%d<T%d", rf.me, rf.CurrentTerm, rf.CurrentTerm, reply.Term)
@@ -899,9 +856,10 @@ func (rf *Raft) TrySyncSnapshot(server int) {
 			rf.VoteFor = -1
 			rf.persist()
 		}
+		rf.lastCommunicateTime = time.Now()
+		rf.mu.Unlock()
 	} else {
-		DebugOutput(dError, "S%d T%d SendSS(atT%d) to %d error", rf.me, rf.CurrentTerm, args.Term,
-			server)
+		DebugOutput(dError, "S%d SendSS(atT%d) to %d error", rf.me, args.Term, server)
 	}
 }
 
@@ -961,6 +919,7 @@ func (rf *Raft) TrySendRP(sentTerm int, server int) {
 			rf.VoteFor = -1
 			rf.persist()
 		}
+		rf.lastCommunicateTime = time.Now()
 		// check still the term
 		// check log not increase
 		if rf.CurrentTerm == lastTerm && len(rf.Log) == lastLen {
@@ -1048,7 +1007,7 @@ func (rf *Raft) ticker() {
 		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 200 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1065,7 +1024,7 @@ func (rf *Raft) sendHB() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable hb time?
-		ms := 200 + (rand.Int63() % 100)
+		ms := 100 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1102,7 +1061,7 @@ func (rf *Raft) SyncSnapshot() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable sync snapshot time?
-		ms := 100 + (rand.Int63() % 150)
+		ms := 50 + (rand.Int63() % 50)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1133,7 +1092,7 @@ func (rf *Raft) TryApply(applyCh chan ApplyMsg) {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable check time?
-		ms := 50 + (rand.Int63() % 150)
+		ms := 50 + (rand.Int63() % 50)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1141,6 +1100,11 @@ func (rf *Raft) TryApply(applyCh chan ApplyMsg) {
 func (rf *Raft) IfElectionTimeout() bool {
 	now := time.Now()
 	return now.Sub(rf.lastTouchedTime) > rf.electionTimeout
+}
+
+func (rf *Raft) IfLastCommunicationTimeout() bool {
+	now := time.Now()
+	return now.Sub(rf.lastCommunicateTime) > 1500*time.Millisecond
 }
 
 // special condition:
@@ -1200,12 +1164,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.TryReplica()
 	// start sync snapshot goroutine
 	go rf.SyncSnapshot()
-	// start increase commit gorountine
-	//go rf.IncreaseCommitIndex()
 	// start apply cmd goroutine
 	go rf.TryApply(applyCh)
-	// start apply snapshot go-routine
-	//	go rf.TryApplySnapShot(applyCh)
-	//go rf.Breaker()
 	return rf
 }
