@@ -80,6 +80,8 @@ type Raft struct {
 	lastCommunicateTime time.Time // for leader to down..
 	nextIndex           []int
 	matchIndex          []int
+	snapshotIndex       []int
+	snapshotCommitIndex int
 	// chan for 2D
 	ApplyChan chan ApplyMsg
 }
@@ -229,8 +231,8 @@ func (rf *Raft) readPersist(data []byte) {
 	} else {
 		rf.SnapshotSaved = nil
 	}
-	rf.lastApplied = rf.LastIncludedIndex
-	if rf.Role == LEADER { // down, need to re-election
+	rf.lastApplied = rf.LastIncludedIndex // TODO, it needs?
+	if rf.Role == LEADER {                // down, need to re-election // TODO, it needs?
 		DebugOutput(dRole, "S%d T%d down to follower", rf.me, rf.CurrentTerm)
 		rf.Role = FOLLOWER
 		rf.ClearVoteMap()
@@ -279,24 +281,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.nextIndex[i] = len(rf.Log) // lastest index + 1
 		rf.matchIndex[i] = 0
 	}
-	if rf.lastApplied < rf.LastIncludedIndex {
-		DebugOutput(dAPPL, "S%d T%d apply SS Si:%d ST:%d", rf.me, rf.CurrentTerm,
-			rf.LastIncludedIndex, rf.LastIncludedTerm)
-		msg := ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      rf.SnapshotSaved,
-			SnapshotIndex: rf.LastIncludedIndex,
-			SnapshotTerm:  rf.LastIncludedTerm,
-		}
-		rf.lastApplied = rf.LastIncludedIndex
-		rf.mu.Unlock()
-		rf.ApplyChan <- msg // send msg, need a thread?
-	} else {
-		DebugOutput(dAPPL, "S%d T%d SS Si:%d(<=%d) ST:%d no need to apply", rf.me, rf.CurrentTerm,
-			rf.LastIncludedIndex, rf.lastApplied, rf.LastIncludedTerm)
-		rf.mu.Unlock()
-	}
-
+	rf.snapshotIndex[rf.me] = index // wait for apply..
+	rf.mu.Unlock()
 }
 
 // example RequestVote RPC arguments structure.
@@ -522,23 +508,54 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	reply.Term = rf.CurrentTerm
 	if args.Term < rf.CurrentTerm { // ignore
+		reply.Success = false
 		rf.mu.Unlock()
 		return
 	}
-	if args.LastIncludedIndex <= rf.lastApplied { // shorter,no apply
-		DebugOutput(dInfo, "S%d T%d Si(%d)<=(%d) St:%d, no replace and apply", rf.me, rf.CurrentTerm,
-			args.LastIncludedIndex, rf.lastApplied, args.LastIncludedTerm)
+
+	if args.LastIncludedIndex < rf.LastIncludedIndex { // shorter,no apply
+		DebugOutput(dInfo, "S%d T%d Si(%d)<(%d) St:%d, no replace and apply", rf.me, rf.CurrentTerm,
+			args.LastIncludedIndex, rf.LastIncludedIndex, args.LastIncludedTerm)
+		reply.Success = true
 		rf.mu.Unlock()
 		return
 	}
+
 	if args.LastIncludedIndex == rf.LastIncludedIndex && args.LastIncludedTerm == rf.LastIncludedTerm {
-		DebugOutput(dULCK, "S%d T%d SameSnapShot with LD%d Id:%d Tm:%d",
-			rf.me, rf.CurrentTerm, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
+		DebugOutput(dInfo, "S%d T%d SameSnapShot with LD%d Si:%d ST:%d Smit:%d MeMit:%d Meapplied:%d",
+			rf.me, rf.CurrentTerm, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm,
+			args.SnapshotCommitIndex, rf.snapshotCommitIndex, rf.lastApplied)
+		reply.Success = true
+		if args.SnapshotCommitIndex > rf.snapshotCommitIndex { // update snapshotCommitIndex;;
+			rf.snapshotCommitIndex = args.SnapshotCommitIndex
+			if rf.snapshotCommitIndex > rf.lastApplied {
+				DebugOutput(dAPPL, "S%d T%d apply SS(%d>%d) SI:%d ST:%d", rf.me, rf.CurrentTerm,
+					args.SnapshotCommitIndex, rf.snapshotCommitIndex, rf.LastIncludedIndex, rf.LastIncludedTerm)
+				// change the last applied
+				rf.commitIndex = MaxInt(rf.commitIndex, rf.LastIncludedIndex)
+				rf.lastApplied = rf.LastIncludedIndex
+				msg := ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      rf.SnapshotSaved,
+					SnapshotIndex: rf.LastIncludedIndex,
+					SnapshotTerm:  rf.LastIncludedTerm,
+				}
+				rf.ApplyChan <- msg // can use thread here, because we must prove the order of apply command...
+				rf.mu.Unlock()
+			} else {
+				rf.mu.Unlock()
+			}
+			DebugOutput(dInfo, "S%d InstallSS return", rf.me)
+			return
+		}
 		rf.mu.Unlock()
+		DebugOutput(dInfo, "S%d InstallSS return", rf.me)
 		return
 	}
-	DebugOutput(dULCK, "S%d T%d Install from LD%d Id:%d Tm:%d", rf.me, rf.CurrentTerm, args.LeaderId,
-		args.LastIncludedIndex, args.LastIncludedTerm)
+
+	reply.Success = true
+	DebugOutput(dULCK, "S%d T%d Install from LD%d Id:%d Tm:%d, CommitedSS:%d", rf.me, rf.CurrentTerm, args.LeaderId,
+		args.LastIncludedIndex, args.LastIncludedTerm, args.SnapshotCommitIndex)
 	// copied from snapshot
 	rf.lastTouchedTime = time.Now()
 	lastStart := rf.MapIndexToPhysical(args.LastIncludedIndex)
@@ -556,17 +573,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.SnapshotSaved = args.SnapshotData
 	DebugOutput(dInfo, "S%d T%d remapped Log bI:%d l:%d", rf.me, rf.CurrentTerm, rf.LastIncludedIndex+1, len(rf.Log))
 	rf.persist()
-	// change the last applied
-	rf.commitIndex = MaxInt(rf.commitIndex, rf.LastIncludedIndex)
-	rf.lastApplied = rf.LastIncludedIndex
-	// send msg..
-	msg := ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      rf.SnapshotSaved,
-		SnapshotIndex: rf.LastIncludedIndex,
-		SnapshotTerm:  rf.LastIncludedTerm,
-	}
-	rf.ApplyChan <- msg // can use thread here, because we must prove the order of apply command...
 	rf.mu.Unlock()
 }
 
@@ -631,15 +637,17 @@ type AppendEntriesReply struct {
 }
 
 type InstallSnapshotArgs struct {
-	Term              int
-	LeaderId          int
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	SnapshotData      []byte
+	Term                int
+	LeaderId            int
+	LastIncludedIndex   int
+	LastIncludedTerm    int
+	SnapshotData        []byte
+	SnapshotCommitIndex int
 }
 
 type InstallSnapshotReply struct {
-	Term int
+	Success bool
+	Term    int
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -772,6 +780,7 @@ func (rf *Raft) TryRequestVote(sentTerm int, server int) {
 			for i := 0; i < len(rf.peers); i++ {
 				rf.nextIndex[i] = len(rf.Log) // lastest index + 1
 				rf.matchIndex[i] = 0
+				rf.snapshotIndex[i] = 0
 			}
 			//DebugOutput(dULCK, "S%d T%d uck", rf.me, rf.CurrentTerm)
 			tmpTerm := rf.CurrentTerm
@@ -830,18 +839,19 @@ func (rf *Raft) TrySendHB(term int, server int) {
 	}
 }
 
-func (rf *Raft) TrySyncSnapshot(server int) {
+func (rf *Raft) TrySyncSnapshot(server int, applyCh chan ApplyMsg) {
 	rf.mu.Lock()
 	if rf.Role != LEADER || rf.SnapshotSaved == nil { // not send now..
 		rf.mu.Unlock()
 		return
 	}
 	args := InstallSnapshotArgs{
-		Term:              rf.CurrentTerm,
-		LeaderId:          rf.me,
-		LastIncludedIndex: rf.LastIncludedIndex,
-		LastIncludedTerm:  rf.LastIncludedTerm,
-		SnapshotData:      rf.SnapshotSaved,
+		Term:                rf.CurrentTerm,
+		LeaderId:            rf.me,
+		LastIncludedIndex:   rf.LastIncludedIndex,
+		LastIncludedTerm:    rf.LastIncludedTerm,
+		SnapshotData:        rf.SnapshotSaved,
+		SnapshotCommitIndex: rf.snapshotCommitIndex,
 	}
 	reply := InstallSnapshotReply{}
 	rf.mu.Unlock()
@@ -857,7 +867,41 @@ func (rf *Raft) TrySyncSnapshot(server int) {
 			rf.persist()
 		}
 		rf.lastCommunicateTime = time.Now()
-		rf.mu.Unlock()
+		if reply.Success {
+			rf.snapshotIndex[server] = args.LastIncludedIndex
+			if args.LastIncludedIndex > rf.snapshotCommitIndex { // apply increase
+				cnt := 0
+				for i := 0; i < len(rf.peers); i++ {
+					if rf.snapshotIndex[i] >= args.LastIncludedIndex {
+						cnt++
+					}
+				}
+				if cnt*2 >= len(rf.peers) { // leaderCMTR
+					rf.snapshotCommitIndex = args.LastIncludedIndex
+					if rf.snapshotCommitIndex > rf.lastApplied {
+						DebugOutput(dAPPL, "S%d T%d LD apply SS SI:%d ST:%d", rf.me, rf.CurrentTerm, args.LastIncludedIndex,
+							args.LastIncludedTerm)
+
+						msg := ApplyMsg{
+							SnapshotValid: true,
+							SnapshotIndex: args.LastIncludedIndex,
+							SnapshotTerm:  args.LastIncludedTerm,
+							Snapshot:      args.SnapshotData,
+						}
+						rf.mu.Unlock()
+						applyCh <- msg
+					} else {
+						rf.mu.Unlock()
+					}
+				} else {
+					rf.mu.Unlock()
+				}
+			} else {
+				rf.mu.Unlock()
+			}
+		} else {
+			rf.mu.Unlock()
+		}
 	} else {
 		DebugOutput(dError, "S%d SendSS(atT%d) to %d error", rf.me, args.Term, server)
 	}
@@ -1047,14 +1091,14 @@ func (rf *Raft) TryReplica() {
 	}
 }
 
-func (rf *Raft) SyncSnapshot() {
+func (rf *Raft) SyncSnapshot(applyCh chan ApplyMsg) {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		if rf.Role == LEADER {
 			if rf.SnapshotSaved != nil { // have snapshot, try to sync
 				for i := 0; i < len(rf.peers); i++ {
 					if i != rf.me {
-						go rf.TrySyncSnapshot(i)
+						go rf.TrySyncSnapshot(i, applyCh)
 					}
 				}
 			}
@@ -1070,6 +1114,10 @@ func (rf *Raft) TryApply(applyCh chan ApplyMsg) {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		for rf.lastApplied < rf.commitIndex {
+			if rf.lastApplied+1 <= rf.LastIncludedIndex {
+				DebugOutput(dInfo, "S%d T%d %d wait for snapshot to sync", rf.me, rf.CurrentTerm, rf.lastApplied+1)
+				break
+			}
 			DebugOutput(dInfo, "S%d T%d try apply command %d", rf.me, rf.CurrentTerm, rf.lastApplied+1)
 			index := rf.lastApplied + 1
 			index = rf.MapIndexToPhysical(index)
@@ -1140,10 +1188,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.VoteFor = -1
 	rf.Role = FOLLOWER
 	rf.lastApplied = 0
+	rf.snapshotCommitIndex = 0
 	for i := 0; i < len(rf.peers); i++ {
 		rf.GotVotesMap = append(rf.GotVotesMap, false)
 		rf.nextIndex = append(rf.nextIndex, 1)
 		rf.matchIndex = append(rf.matchIndex, 0)
+		rf.snapshotIndex = append(rf.snapshotIndex, 0)
 	}
 	rf.Log = append(rf.Log, IdleEntry)
 	// init for 2d
@@ -1163,7 +1213,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start replica goroutine, try to replica to followers
 	go rf.TryReplica()
 	// start sync snapshot goroutine
-	go rf.SyncSnapshot()
+	go rf.SyncSnapshot(applyCh)
 	// start apply cmd goroutine
 	go rf.TryApply(applyCh)
 	return rf
