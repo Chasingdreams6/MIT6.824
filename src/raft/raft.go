@@ -1086,7 +1086,7 @@ func (rf *Raft) TryReplica() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable replica time?
-		ms := 100 + (rand.Int63() % 150)
+		ms := 50 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
