@@ -460,6 +460,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.mu.Unlock()
 			return // no need copy next...
 		}
+		if len(args.Entries) > 0 && len(rf.Log)-1 == args.PrevLogIndex+len(args.Entries) &&
+			rf.Log[len(rf.Log)-1] == args.Entries[len(args.Entries)-1] { // skip do useless thing...
+			goto compareLabel
+		}
 		if len(rf.Log) > args.PrevLogIndex+1+args.LastIncludedIndex {
 			rf.Log = rf.Log[:args.PrevLogIndex+1+args.LastIncludedIndex] // strip
 			DebugOutput(dInfo, "S%d T%d stripped to [:%d)", rf.me, rf.CurrentTerm, args.PrevLogIndex+1+args.LastIncludedIndex)
@@ -480,6 +484,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			DebugOutput(dInfo, "S%d T%d Now Log len=%d SI:%d", rf.me, rf.CurrentTerm, len(rf.Log), rf.LastIncludedIndex)
 			rf.persist()
 		}
+	compareLabel:
 		reply.Success = true // when success, index is useless
 		// part5, change commitIndex, this must happen after check
 		// add more check, the lastIncludedIndex check
@@ -676,11 +681,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		//DebugOutput(dInfo, "S%d T%d RTC_NLD index:%d", rf.me, rf.CurrentTerm, index)
 		return index, term, isLeader
 	}
-	if rf.IfLastCommunicationTimeout() {
-		DebugOutput(dRole, "S%d T%d not leader because isolation",
-			rf.me, rf.CurrentTerm)
-		return index, term, false
-	}
+	//if rf.IfLastCommunicationTimeout() {
+	//	DebugOutput(dRole, "S%d T%d not leader because isolation",
+	//		rf.me, rf.CurrentTerm)
+	//	return index, term, false
+	//}
 	// Your code here (2B).
 	DebugOutput(dEntr, "S%d T%d add EnT(%v) at %d(ac:%d)", rf.me, rf.CurrentTerm,
 		command, len(rf.Log), len(rf.Log)+rf.LastIncludedIndex)
@@ -1068,7 +1073,7 @@ func (rf *Raft) sendHB() {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable hb time?
-		ms := 100 + (rand.Int63() % 100)
+		ms := 50 + (rand.Int63() % 50)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1079,14 +1084,14 @@ func (rf *Raft) TryReplica() {
 		if rf.Role == LEADER {
 			tmpTerm := rf.CurrentTerm
 			for i := 0; i < len(rf.peers); i++ {
-				if i != rf.me { // other
+				if i != rf.me && rf.matchIndex[i] < len(rf.Log)-1 { // other
 					go rf.TrySendRP(tmpTerm, i)
 				}
 			}
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable replica time?
-		ms := 50 + (rand.Int63() % 100)
+		ms := 10 + (rand.Int63() % 20)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1105,7 +1110,7 @@ func (rf *Raft) SyncSnapshot(applyCh chan ApplyMsg) {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable sync snapshot time?
-		ms := 50 + (rand.Int63() % 50)
+		ms := 10 + (rand.Int63() % 20)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1118,9 +1123,14 @@ func (rf *Raft) TryApply(applyCh chan ApplyMsg) {
 				DebugOutput(dInfo, "S%d T%d %d wait for snapshot to sync", rf.me, rf.CurrentTerm, rf.lastApplied+1)
 				break
 			}
-			DebugOutput(dInfo, "S%d T%d try apply command %d", rf.me, rf.CurrentTerm, rf.lastApplied+1)
 			index := rf.lastApplied + 1
 			index = rf.MapIndexToPhysical(index)
+			if index >= len(rf.Log) {
+				DebugOutput(dInfo, "S%d T%d command at %d(ac:%d) is missed"+
+					", wait for sync", rf.me, rf.CurrentTerm, index, rf.lastApplied+1)
+				break
+			}
+			DebugOutput(dInfo, "S%d T%d try apply command %d", rf.me, rf.CurrentTerm, rf.lastApplied+1)
 			if rf.lastApplied+1 > rf.LastIncludedIndex {
 				DebugOutput(dAPPL, "S%d T%d apply command at %d(ac:%d)", rf.me, rf.CurrentTerm,
 					index, rf.lastApplied+1)
@@ -1140,7 +1150,7 @@ func (rf *Raft) TryApply(applyCh chan ApplyMsg) {
 		}
 		rf.mu.Unlock()
 		// TODO What's the suitable check time?
-		ms := 50 + (rand.Int63() % 50)
+		ms := 10 + (rand.Int63() % 10)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }

@@ -27,10 +27,15 @@ type Op struct {
 	Key   string // key
 	Value string // value
 	ID    int64  // ID is only mark
+	Kind  string // Read/Write
 }
+
+const READ = "read"
+const WRITE = "write"
 
 type KVServer struct {
 	mu      sync.Mutex
+	pamu    sync.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -41,7 +46,6 @@ type KVServer struct {
 	// Your definitions here.
 	Database      map[string]string // key->value
 	DuplicatedMap map[int64]bool    // int64->bool
-
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -49,24 +53,52 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	_, isLeader := kv.rf.GetState()
-	if isLeader == false { // false, ret
+	if isLeader == false {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	v, ok := kv.Database[args.Key]
+	cmd := Op{}
+	cmd.ID = args.ID
+	cmd.Key = args.Key
+	cmd.Kind = READ
+
+	index, _, ok := kv.rf.Start(cmd)
 	if ok {
-		reply.Err = OK
-		reply.Value = v
+		startTime := time.Now()
+		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+			if kv.DuplicatedMap[cmd.ID] { // success to read
+				reply.Err = OK
+				reply.Value, ok = kv.Database[cmd.Key]
+				if ok {
+					DPrintf("[S%d] success to read id=%d k=%s vh=%v", kv.me, cmd.ID%SHOW_BIT, cmd.Key, reply.Value)
+					reply.Err = OK
+				} else {
+					reply.Value = ""
+					reply.Err = ErrNoKey
+					DPrintf("[S%d] read no key id=%d k=%s vh=%v", kv.me, cmd.ID%SHOW_BIT, cmd.Key, reply.Value)
+				}
+				return
+			}
+			kv.mu.Unlock()
+			ms := 30 + rand.Int()%40
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			kv.mu.Lock()
+		}
+		// not agreement..
+		DPrintf("[FATAL]: ID:%v key=%s at Index:%d Not Agree",
+			args.ID%SHOW_BIT, args.Key, index)
+		reply.Err = ErrWrongLeader // TODO what to do here?
 		return
 	} else {
-		reply.Err = ErrNoKey
-		reply.Value = ""
+		reply.Err = ErrWrongLeader
 		return
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.pamu.Lock()
+	defer kv.pamu.Unlock()
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	_, isLeader := kv.rf.GetState()
@@ -84,49 +116,66 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		cmd.Key = args.Key
 		cmd.ID = args.ID
 		cmd.Value = args.Value
+		cmd.Kind = WRITE
 	}
 
-	if args.Op == "Append" { // append
-		v, ok := kv.Database[args.Key]
-		if !ok {
-			v = ""
+	if args.Op == "Append" { // append = get + put
+
+		cmd1 := Op{}
+		cmd1.ID = nrand()
+		cmd1.Key = args.Key
+		cmd1.Kind = READ
+
+		var v string
+		index, _, ok := kv.rf.Start(cmd1)
+		if ok {
+			DPrintf("[S%d] Append, first read Id=%v key=%s", kv.me, cmd1.ID%SHOW_BIT, cmd1.Key)
+			startTime := time.Now()
+			for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+				if kv.DuplicatedMap[cmd1.ID] { // success to read
+					v = kv.Database[args.Key]
+					DPrintf("[S%d] Append, got v=%v skip to append", kv.me, v)
+					goto nextLabel
+				}
+				kv.mu.Unlock()
+				ms := 30 + rand.Int()%40
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+				kv.mu.Lock()
+			}
+			// not agreement..
+			DPrintf("[FATAL]: ID:%v key=%s at Index:%d Not Agree",
+				args.ID%SHOW_BIT, args.Key, index)
+			reply.Err = ErrWrongLeader // TODO what to do here?
+			return
+		} else {
+			reply.Err = ErrWrongLeader
+			return
 		}
+	nextLabel:
 		v = v + args.Value
 		cmd.Key = args.Key
 		cmd.ID = args.ID
 		cmd.Value = v
+		cmd.Kind = WRITE
 	}
 
 	index, _, ok := kv.rf.Start(cmd)
 	if ok { // wait for agreement
 		startTime := time.Now()
 		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
-			msg, ok := <-kv.applyCh
-			if ok {
-				if msg.CommandValid {
-					AppliedCmd := msg.Command.(Op)
-					if kv.DuplicatedMap[AppliedCmd.ID] == false { // done
-						kv.DuplicatedMap[AppliedCmd.ID] = true
-						kv.Database[AppliedCmd.Key] = AppliedCmd.Value
-						reply.Err = OK
-						DPrintf("S%d Success to PA ID=%v key=%s v=%v", kv.me,
-							cmd.ID, cmd.Key, KVHash(cmd.Key, cmd.Value))
-						return
-					} else { // done before
-						reply.Err = OK
-						DPrintf("S%d Duplicated PA ID=%v key=%s v=%v", kv.me,
-							cmd.ID, cmd.Key, KVHash(cmd.Key, cmd.Value))
-						return
-					}
-				}
-			} else {
-				ms := 100 + rand.Int()%100
-				time.Sleep(time.Duration(ms) * time.Millisecond)
+			if kv.DuplicatedMap[cmd.ID] { // success to achieve agreement
+				reply.Err = OK
+				DPrintf("[S%d] success to put/append id=%d k=%s vh=%v", kv.me, cmd.ID%SHOW_BIT, cmd.Key, cmd.Value)
+				return
 			}
+			kv.mu.Unlock()
+			ms := 30 + rand.Int()%40
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			kv.mu.Lock()
 		}
 		// not agreement..
-		DPrintf("[FATAL]: ID:%v key=%s v=%s at Index:%d Not Agree",
-			args.ID, args.Key, args.Value, index)
+		DPrintf("[FATAL]: ID:%v key=%s v=%v at Index:%d Not Agree",
+			args.ID%SHOW_BIT, args.Key, VHash(args.Value), index)
 		reply.Err = ErrWrongLeader // TODO what to do here?
 		return
 	} else {
@@ -154,6 +203,35 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+// background go-routine for handle applyMSg
+func (kv *KVServer) applier(applyChan chan raft.ApplyMsg) {
+	for msg := range applyChan {
+		if msg.CommandValid {
+			kv.mu.Lock()
+			AppliedCmd := msg.Command.(Op)
+			if AppliedCmd.Kind == WRITE {
+				if kv.DuplicatedMap[AppliedCmd.ID] == false { // done
+					kv.DuplicatedMap[AppliedCmd.ID] = true
+					kv.Database[AppliedCmd.Key] = AppliedCmd.Value
+					DPrintf("S[%d] Applier Success to PA ID=%v key=%s v=%v", kv.me,
+						AppliedCmd.ID%SHOW_BIT, AppliedCmd.Key, AppliedCmd.Value)
+				} else { // done before
+					DPrintf("S[%d] Applier Duplicated PA ID=%v key=%s v=%v", kv.me,
+						AppliedCmd.ID%SHOW_BIT, AppliedCmd.Key, AppliedCmd.Value)
+				}
+			} else {
+				if kv.DuplicatedMap[AppliedCmd.ID] == false {
+					kv.DuplicatedMap[AppliedCmd.ID] = true
+					DPrintf("S[%d] Applier Read Id=%v key=%s", kv.me, AppliedCmd.ID%SHOW_BIT, AppliedCmd.Key)
+				} else {
+					DPrintf("S[%d] Applier Duplicated Read Id=%v key=%s", kv.me, AppliedCmd.ID%SHOW_BIT, AppliedCmd.Key)
+				}
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -178,5 +256,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.Database = make(map[string]string)
 	kv.DuplicatedMap = make(map[int64]bool)
+	go kv.applier(kv.applyCh)
+	time.Sleep(10 * time.Millisecond)
 	return kv
 }

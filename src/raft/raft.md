@@ -10,6 +10,8 @@
 ### Design Principle
 1. Use LOCK+POLL rather than Channel. Because Pooling is more simple, but needs design timeout carefully.
 2. Use some background go-routine to check some status and do some jobs.
+3. Use low heartbeat rate + high frequency poll to increase performance. Some operation such as RP, InstallSnapshot will also be seen as heartbeat.
+
 
 ### Debugging
 1. `dlog` is a python3 script for present output.
@@ -85,4 +87,5 @@ We should change the logic of leader-election and RP.
 
 #### Drawback
 
-1. When using 8th intel i5 cpu, it may consume 110~130 seconds in 2D Part. Maybe we can adjust some timeout and use better machine to evaluate.
+1. When using 8th intel i5 cpu, it may consume 60~80 seconds in 2D Part. Maybe we can adjust some timeout and use better machine to evaluate.
+2. Although `Start()` doesn't prove the agreement of execution. But if a leader is leader now, it response to `start()`'s caller correctly, but it down to follower immediately. The log will lose. We know use very high frequency poll to let replica happen before leader's change. But it can not prevent this situation perfectly.

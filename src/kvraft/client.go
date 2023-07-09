@@ -1,6 +1,9 @@
 package kvraft
 
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
 
@@ -8,6 +11,7 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	lastLeader int
+	me         int
 }
 
 func nrand() int64 {
@@ -22,6 +26,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.lastLeader = 0 // start from 0
+	ck.me = int(nrand() % 100)
 	return ck
 }
 
@@ -36,40 +41,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 // use synchornous number
+// TODO, what's the consensus?
 func (ck *Clerk) Get(key string) string {
 	Id := nrand()
-	DPrintf("Get Id=%v key=%s", Id%SHOW_BIT, key)
+	DPrintf("[C%d]Get Id=%v key=%s", ck.me, Id%SHOW_BIT, key)
+	st := ck.lastLeader
 	for {
+		//res := make(map[string]int)
 		for i := 0; i < len(ck.servers); i++ {
-			server := (i + ck.lastLeader) % len(ck.servers) // got target server
-			for {
-				args := GetArgs{
-					Key: key,
-					ID:  Id,
+			server := (i + st) % len(ck.servers) // got target server
+			DPrintf("[C%d]Get S=%d", ck.me, server)
+			args := GetArgs{
+				Key: key,
+				ID:  Id,
+			}
+			reply := GetReply{}
+			ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+			if ok {
+				if reply.Err == ErrWrongLeader { // continue
+					continue
 				}
-				reply := GetReply{}
-				ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
-				if ok {
-					if reply.Err == ErrNoKey { // response ""
-						DPrintf("	Get Id=%v key=%s NotExist!", Id%SHOW_BIT, key)
-						ck.lastLeader = server
-						return ""
-					}
-					if reply.Err == ErrWrongLeader { // switch
-						DPrintf("	Get Id=%v key=%s S%d not leader!", Id%SHOW_BIT, key, server)
-						break
-					}
-					if reply.Err == OK { // response correctly
-						DPrintf("	Get Id=%v key=%s vh=%v", Id%SHOW_BIT, key, VHash(reply.Value))
-						ck.lastLeader = server
-						return reply.Value
-					}
-				} else { // retry
-					DPrintf("	Get Id=%v S=%d Key=%s Error, retry", Id%SHOW_BIT,
-						server, key)
+				if reply.Err == OK || reply.Err == ErrNoKey {
+					ck.lastLeader = server
+					DPrintf("	[C%d]Get Id=%v key=%s vh=%v", ck.me, Id%SHOW_BIT, key, VHash(reply.Value))
+					return reply.Value
 				}
 			}
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -85,37 +84,39 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	Id := nrand()
 
-	DPrintf("PA Id=%v key=%s vh=%v op=%s", Id, key, KVHash(key, value), op)
+	DPrintf("[C%d]PA Id=%v key=%s vh=%v op=%s", ck.me, Id%SHOW_BIT, key, VHash(value), op)
 	for { // handler leader change
+		st := ck.lastLeader
 		for i := 0; i < len(ck.servers); i++ { // handle wrong leader
-			server := (i + ck.lastLeader) % len(ck.servers) // got target server
-			for {                                           // handle network error
-				args := PutAppendArgs{
-					Key:   key,
-					Value: value,
-					Op:    op,
-					ID:    Id,
+			server := (i + st) % len(ck.servers) // got target server
+			//DPrintf("[C%d]PA S=%d", ck.me, server)
+			args := PutAppendArgs{
+				Key:   key,
+				Value: value,
+				Op:    op,
+				ID:    Id,
+			}
+			reply := PutAppendReply{}
+			ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+			if ok {
+				if reply.Err == ErrNoKey { // TODO may not happen?
+					DPrintf("	[C%d]PA Id=%v UnexpectedResponse", ck.me, Id%SHOW_BIT) // retry
 				}
-				reply := PutAppendReply{}
-				ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
-				if ok {
-					if reply.Err == ErrNoKey { // TODO may not happen?
-						DPrintf("	PA Id=%v UnexpectedResponse", Id) // retry
-					}
-					if reply.Err == ErrWrongLeader { // switch leader
-						DPrintf("	PA Id=%v S%d not leader!", Id, server)
-						break
-					}
-					if reply.Err == OK {
-						DPrintf("	PA Id=%v Success", Id)
-						ck.lastLeader = server
-						return
-					}
-				} else {
-					DPrintf("	PA Id=%v S=%d Error, retry", Id, server)
+				if reply.Err == ErrWrongLeader { // switch leader
+					//DPrintf("	[C%d]PA Id=%v S%d not leader!", ck.me, Id%SHOW_BIT, server)
+					continue
 				}
+				if reply.Err == OK {
+					DPrintf("	[C%d]PA Id=%v Success", ck.me, Id%SHOW_BIT)
+					ck.lastLeader = server
+					return
+				}
+			} else {
+				//DPrintf("	[C%d]PA Id=%v S=%d Error, retry", ck.me, Id%SHOW_BIT, server)
+				continue
 			}
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
