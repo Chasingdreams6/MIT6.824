@@ -1,7 +1,9 @@
 package kvraft
 
 import (
+	"6.5840/labgob"
 	"6.5840/labrpc"
+	"sync"
 	"time"
 )
 import "crypto/rand"
@@ -12,6 +14,7 @@ type Clerk struct {
 	// You will have to modify this struct.
 	lastLeader int
 	me         int
+	mu         sync.Mutex
 }
 
 func nrand() int64 {
@@ -22,11 +25,22 @@ func nrand() int64 {
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
+
+	labgob.Register(Op{})
+	labgob.Register(PutAppendArgs{})
+	labgob.Register(PutAppendReply{})
+	labgob.Register(GetArgs{})
+	labgob.Register(GetReply{})
+
+	if debugStart.IsZero() {
+		debugStart = time.Now()
+	}
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.lastLeader = 0 // start from 0
 	ck.me = int(nrand() % 100)
+	time.Sleep(500 * time.Millisecond)
 	return ck
 }
 
@@ -43,6 +57,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // use synchornous number
 // TODO, what's the consensus?
 func (ck *Clerk) Get(key string) string {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	Id := nrand()
 	DPrintf("[C%d]Get Id=%v key=%s", ck.me, Id%SHOW_BIT, key)
 	st := ck.lastLeader
@@ -50,7 +66,7 @@ func (ck *Clerk) Get(key string) string {
 		//res := make(map[string]int)
 		for i := 0; i < len(ck.servers); i++ {
 			server := (i + st) % len(ck.servers) // got target server
-			DPrintf("[C%d]Get S=%d", ck.me, server)
+			DPrintf("[C%d]i=%d Get S=%d Id=%v", ck.me, i, server, Id%SHOW_BIT)
 			args := GetArgs{
 				Key: key,
 				ID:  Id,
@@ -59,17 +75,35 @@ func (ck *Clerk) Get(key string) string {
 			ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
 			if ok {
 				if reply.Err == ErrWrongLeader { // continue
+					DPrintf("[C%d] S=%d Not leader, continue", ck.me, server)
 					continue
 				}
 				if reply.Err == OK || reply.Err == ErrNoKey {
 					ck.lastLeader = server
-					DPrintf("	[C%d]Get Id=%v key=%s vh=%v", ck.me, Id%SHOW_BIT, key, VHash(reply.Value))
+					DPrintf("	[C%d]Get Id=%v key=%s vh=%v form %d", ck.me, Id%SHOW_BIT, key, reply.Value, server)
 					return reply.Value
 				}
+			} else {
+				DPrintf("	[C%d]READ Id=%v S=%d Error, next", ck.me, Id%SHOW_BIT, server)
+				continue
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
+	//for i := 0; i < 9; i++ {
+	//	server := i % 3
+	//	Id := i % 3
+	//	args := GetArgs{Key: key, ID: int64(Id)}
+	//	reply := GetReply{}
+	//	DPrintf("[C%d]Get S=%d Id=%v", ck.me, server, Id%SHOW_BIT)
+	//	ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+	//	if ok {
+	//		DPrintf("[C%d] ok reply from %d", ck.me, server)
+	//	} else {
+	//		DPrintf("[C%d] fail reply from %d", ck.me, server)
+	//	}
+	//}
+	//return ""
 }
 
 // shared by Put and Append.
@@ -82,9 +116,10 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	Id := nrand()
-
-	DPrintf("[C%d]PA Id=%v key=%s vh=%v op=%s", ck.me, Id%SHOW_BIT, key, VHash(value), op)
+	DPrintf("[C%d]PA Id=%v key=%s vh=%v op=%s", ck.me, Id%SHOW_BIT, key, value, op)
 	for { // handler leader change
 		st := ck.lastLeader
 		for i := 0; i < len(ck.servers); i++ { // handle wrong leader
@@ -103,7 +138,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					DPrintf("	[C%d]PA Id=%v UnexpectedResponse", ck.me, Id%SHOW_BIT) // retry
 				}
 				if reply.Err == ErrWrongLeader { // switch leader
-					//DPrintf("	[C%d]PA Id=%v S%d not leader!", ck.me, Id%SHOW_BIT, server)
+					DPrintf("	[C%d]PA Id=%v S%d not leader!", ck.me, Id%SHOW_BIT, server)
 					continue
 				}
 				if reply.Err == OK {
@@ -112,11 +147,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					return
 				}
 			} else {
-				//DPrintf("	[C%d]PA Id=%v S=%d Error, retry", ck.me, Id%SHOW_BIT, server)
+				DPrintf("	[C%d]PA Id=%v S=%d Error, next", ck.me, Id%SHOW_BIT, server)
 				continue
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

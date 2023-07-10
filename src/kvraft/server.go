@@ -4,8 +4,11 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
+	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +17,12 @@ import (
 const Debug = true
 
 func DPrintf(format string, a ...interface{}) {
+
 	if Debug {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d ", time)
+		format = prefix + format
 		log.Printf(format, a...)
 	}
 	return
@@ -34,13 +42,13 @@ const READ = "read"
 const WRITE = "write"
 
 type KVServer struct {
-	mu      sync.Mutex
-	pamu    sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
-
+	mu           sync.Mutex
+	pamu         sync.Mutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
+	dead         int32 // set by Kill()
+	persister    *raft.Persister
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
@@ -48,10 +56,71 @@ type KVServer struct {
 	DuplicatedMap map[int64]bool    // int64->bool
 }
 
+func (kv *KVServer) MakeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	Dblen := len(kv.Database)
+	e.Encode(Dblen)
+	for K, V := range kv.Database {
+		e.Encode(K)
+		e.Encode(V)
+	}
+	Dulen := len(kv.DuplicatedMap)
+	e.Encode(Dulen)
+	for K, _ := range kv.DuplicatedMap {
+		str := strconv.FormatInt(K, 10)
+		e.Encode(str)
+	}
+	return w.Bytes()
+}
+
+func (kv *KVServer) ReadSnapshot(snapshot []byte) {
+
+	//kv.Database = make(map[string]string)
+	//kv.DuplicatedMap = make(map[int64]bool)
+	//kv.mu.Lock()
+	//defer kv.mu.Unlock()
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var Dblen, Dulen int
+	if d.Decode(&Dblen) != nil {
+		DPrintf("[FATAL] DECODE error")
+		return
+	}
+	var K, V string
+	for i := 0; i < Dblen; i++ {
+		if d.Decode(&K) != nil || d.Decode(&V) != nil {
+			DPrintf("[FATAL] DECODE error")
+			return
+		}
+		kv.Database[K] = V
+		DPrintf("S[%d] ReadSnapshot k=%s v=%s", kv.me, K, V)
+	}
+	if d.Decode(&Dulen) != nil {
+		DPrintf("[FATAL] DECODE error")
+		return
+	}
+	var str string
+	for i := 0; i < Dulen; i++ {
+		if d.Decode(&str) != nil {
+			DPrintf("[FATAL] DECODE error")
+			return
+		}
+		K1, err := strconv.ParseInt(str, 10, 64)
+		if err != nil {
+			DPrintf("[FATAL] DECODE error")
+			return
+		}
+		kv.DuplicatedMap[K1] = true
+	}
+
+}
+
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	DPrintf("[S%d] Got RPC id=%d", kv.me, args.ID%SHOW_BIT)
 	_, isLeader := kv.rf.GetState()
 	if isLeader == false {
 		reply.Err = ErrWrongLeader
@@ -61,11 +130,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	cmd.ID = args.ID
 	cmd.Key = args.Key
 	cmd.Kind = READ
-
+	DPrintf("[S%d] believe leader, start agree id=%v", kv.me, args.ID%SHOW_BIT)
 	index, _, ok := kv.rf.Start(cmd)
 	if ok {
 		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+		for time.Now().Sub(startTime) < 4*time.Second { // waiting for agreement
 			if kv.DuplicatedMap[cmd.ID] { // success to read
 				reply.Err = OK
 				reply.Value, ok = kv.Database[cmd.Key]
@@ -85,14 +154,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			kv.mu.Lock()
 		}
 		// not agreement..
-		DPrintf("[FATAL]: ID:%v key=%s at Index:%d Not Agree",
-			args.ID%SHOW_BIT, args.Key, index)
+		DPrintf("[FATAL%d]: GET ID:%v key=%s at Index:%d Not Agree",
+			kv.me, args.ID%SHOW_BIT, args.Key, index)
 		reply.Err = ErrWrongLeader // TODO what to do here?
 		return
 	} else {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -109,6 +179,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	v := kv.DuplicatedMap[args.ID]
 	if v == true { // ok before, ignore
 		reply.Err = OK
+		DPrintf("[S%d] Ignore same PA request ID=%v", kv.me, args.ID)
 		return
 	}
 	cmd := Op{}
@@ -127,30 +198,33 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		cmd1.Kind = READ
 
 		var v string
+		DPrintf("[S%d] believe leader, start agree phase1 id=%v", kv.me, args.ID%SHOW_BIT)
 		index, _, ok := kv.rf.Start(cmd1)
 		if ok {
-			DPrintf("[S%d] Append, first read Id=%v key=%s", kv.me, cmd1.ID%SHOW_BIT, cmd1.Key)
+			DPrintf("[S%d] (%v)Append, first read Id=%v key=%s", kv.me, args.ID%SHOW_BIT, cmd1.ID%SHOW_BIT, cmd1.Key)
 			startTime := time.Now()
-			for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+			for time.Now().Sub(startTime) < 4*time.Second { // waiting for agreement
 				if kv.DuplicatedMap[cmd1.ID] { // success to read
-					v = kv.Database[args.Key]
-					DPrintf("[S%d] Append, got v=%v skip to append", kv.me, v)
+					v, ok = kv.Database[args.Key] // ok may be false because of first empty slot
+					DPrintf("[S%d] (%v)Append, read(%v)got k=%s v=%v skip to append", kv.me, args.ID%SHOW_BIT, cmd1.ID%SHOW_BIT, args.Key, v)
 					goto nextLabel
 				}
 				kv.mu.Unlock()
-				ms := 30 + rand.Int()%40
+				ms := 10 + rand.Int()%10
 				time.Sleep(time.Duration(ms) * time.Millisecond)
 				kv.mu.Lock()
 			}
 			// not agreement..
-			DPrintf("[FATAL]: ID:%v key=%s at Index:%d Not Agree",
-				args.ID%SHOW_BIT, args.Key, index)
+			DPrintf("[FATAL%d]: APPEND_1 ID:%v key=%s at Index:%d Not Agree",
+				kv.me, args.ID%SHOW_BIT, args.Key, index)
 			reply.Err = ErrWrongLeader // TODO what to do here?
 			return
 		} else {
+			DPrintf("[S%d] %v append phase1 start fail", kv.me, args.ID%SHOW_BIT)
 			reply.Err = ErrWrongLeader
 			return
 		}
+
 	nextLabel:
 		v = v + args.Value
 		cmd.Key = args.Key
@@ -159,29 +233,32 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		cmd.Kind = WRITE
 	}
 
+	// retry
+	DPrintf("[S%d] believe leader, start agree phase2 id=%v", kv.me, args.ID%SHOW_BIT)
 	index, _, ok := kv.rf.Start(cmd)
 	if ok { // wait for agreement
 		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+		for time.Now().Sub(startTime) < 4*time.Second { // waiting for agreement
 			if kv.DuplicatedMap[cmd.ID] { // success to achieve agreement
 				reply.Err = OK
 				DPrintf("[S%d] success to put/append id=%d k=%s vh=%v", kv.me, cmd.ID%SHOW_BIT, cmd.Key, cmd.Value)
 				return
 			}
 			kv.mu.Unlock()
-			ms := 30 + rand.Int()%40
+			ms := 10 + rand.Int()%10
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 			kv.mu.Lock()
 		}
 		// not agreement..
-		DPrintf("[FATAL]: ID:%v key=%s v=%v at Index:%d Not Agree",
-			args.ID%SHOW_BIT, args.Key, VHash(args.Value), index)
+		DPrintf("[FATAL%d]: APPEND_2 ID:%v key=%s v=%v at Index:%d Not Agree",
+			kv.me, args.ID%SHOW_BIT, args.Key, args.Value, index)
 		reply.Err = ErrWrongLeader // TODO what to do here?
 		return
 	} else {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -227,6 +304,15 @@ func (kv *KVServer) applier(applyChan chan raft.ApplyMsg) {
 					DPrintf("S[%d] Applier Duplicated Read Id=%v key=%s", kv.me, AppliedCmd.ID%SHOW_BIT, AppliedCmd.Key)
 				}
 			}
+			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate { // make snapshot
+				DPrintf("S[%d] Applier Make Snapshot", kv.me)
+				kv.rf.Snapshot(msg.CommandIndex, kv.MakeSnapshot())
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid { // read snapshot
+			kv.mu.Lock()
+			DPrintf("S[%d] Applier read snapshot", kv.me)
+			kv.ReadSnapshot(msg.Snapshot)
 			kv.mu.Unlock()
 		}
 	}
@@ -248,10 +334,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(PutAppendArgs{})
+	labgob.Register(PutAppendReply{})
+	labgob.Register(GetArgs{})
+	labgob.Register(GetReply{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.Database = make(map[string]string)

@@ -1,6 +1,9 @@
 package kvraft
 
-import "hash/fnv"
+import (
+	"hash/fnv"
+	"time"
+)
 
 const (
 	OK             = "OK"
@@ -8,7 +11,9 @@ const (
 	ErrWrongLeader = "ErrWrongLeader"
 )
 
-const SHOW_BIT = 1000
+const SHOW_BIT = 100000
+
+var debugStart time.Time
 
 type Err string
 
