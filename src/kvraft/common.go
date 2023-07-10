@@ -9,8 +9,10 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrFailAgree   = "ErrFailAgree"
 )
 
+const NOP_String = "gwioasklge-15-3&#$64"
 const SHOW_BIT = 100000
 
 var debugStart time.Time

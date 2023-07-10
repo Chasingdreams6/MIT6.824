@@ -120,23 +120,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("[S%d] Got RPC id=%d", kv.me, args.ID%SHOW_BIT)
 	_, isLeader := kv.rf.GetState()
 	// for follower, wait applyMsg
 	if isLeader == false {
 		reply.Err = ErrWrongLeader
-		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
-			if kv.DuplicatedMap[args.ID] { // success to sync
-				return
-			}
-			kv.mu.Unlock()
-			ms := 30 + rand.Int()%40
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			kv.mu.Lock()
+		if kv.DuplicatedMap[args.ID] {
+			return
 		}
-		DPrintf("[S%d] Fail to agree", kv.me)
-		reply.Value = "fail"
+		reply.Err = ErrFailAgree
 		return
 	}
 	cmd := Op{}
@@ -147,7 +138,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	index, _, ok := kv.rf.Start(cmd) // for leader, try to issue an agreement
 	if ok {
 		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+		for time.Now().Sub(startTime) < 1*time.Second { // waiting for agreement
 			if kv.DuplicatedMap[cmd.ID] { // success to read, set return value
 				reply.Err = OK
 				reply.Value, ok = kv.Database[cmd.Key]
@@ -162,30 +153,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				return
 			}
 			kv.mu.Unlock()
-			ms := 30 + rand.Int()%40
+			ms := 10 + rand.Int()%10
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 			kv.mu.Lock()
 		}
 		// not agreement..
 		DPrintf("[FATAL%d]: GET ID:%v key=%s at Index:%d Not Agree",
 			kv.me, args.ID%SHOW_BIT, args.Key, index)
-		reply.Err = ErrWrongLeader // TODO what to do here?
+		reply.Err = ErrFailAgree // TODO what to do here?
 		reply.Value = kv.Database[args.Key]
 		return
 	} else { // for follower, wait applyMsg
 		reply.Err = ErrWrongLeader
-		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
-			if kv.DuplicatedMap[args.ID] { // success to sync
-				return
-			}
-			kv.mu.Unlock()
-			ms := 30 + rand.Int()%40
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			kv.mu.Lock()
+		if kv.DuplicatedMap[args.ID] {
+			return
 		}
-		DPrintf("[S%d] Fail to agree", kv.me)
-		reply.Value = "fail"
+		reply.Err = ErrFailAgree
 		return
 	}
 
@@ -199,20 +182,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	defer kv.mu.Unlock()
 	_, isLeader := kv.rf.GetState()
 	if isLeader == false { // false, wait for agree
-		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
-			if kv.DuplicatedMap[args.ID] { // success to sync
-				reply.Err = ErrWrongLeader
-				DPrintf("[S%d] not leader, but agree id=%v", kv.me, args.ID%SHOW_BIT)
-				return
-			}
-			kv.mu.Unlock()
-			ms := 30 + rand.Int()%40
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			kv.mu.Lock()
+		if kv.DuplicatedMap[args.ID] { // success to sync
+			reply.Err = ErrWrongLeader
+			return
 		}
-		DPrintf("[S%d] Fail to agree id=%v", kv.me, args.ID%SHOW_BIT)
-		reply.Err = ErrNoKey
+		reply.Err = ErrFailAgree
 		return
 	}
 	v := kv.DuplicatedMap[args.ID]
@@ -245,7 +219,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if ok {
 			DPrintf("[S%d] (%v)Append, first read Id=%v key=%s", kv.me, args.ID%SHOW_BIT, cmd1.ID%SHOW_BIT, cmd1.Key)
 			startTime := time.Now()
-			for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+			for time.Now().Sub(startTime) < 1*time.Second { // waiting for agreement
 				if kv.DuplicatedMap[cmd1.ID] { // success to read
 					v, ok = kv.Database[args.Key] // ok may be false because of first empty slot
 					DPrintf("[S%d] leader, agree rid=%v", kv.me, cmd1.ID%SHOW_BIT)
@@ -257,23 +231,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				kv.mu.Lock()
 			}
 			DPrintf("[S%d] leader, no agree rid=%v", kv.me, cmd1.ID%SHOW_BIT)
-			reply.Err = ErrNoKey
+			reply.Err = ErrFailAgree
 			return
 		} else {
-			startTime := time.Now()
-			for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
-				if kv.DuplicatedMap[args.ID] { // success to sync
-					reply.Err = ErrWrongLeader
-					DPrintf("[S%d] not leader, agree id=%v", kv.me, args.ID%SHOW_BIT)
-					return
-				}
-				kv.mu.Unlock()
-				ms := 30 + rand.Int()%40
-				time.Sleep(time.Duration(ms) * time.Millisecond)
-				kv.mu.Lock()
+			if kv.DuplicatedMap[args.ID] { // success to sync
+				reply.Err = ErrWrongLeader
+				return
 			}
-			DPrintf("[S%d] not leader, no agree id=%v", kv.me, args.ID%SHOW_BIT)
-			reply.Err = ErrNoKey
+			reply.Err = ErrFailAgree
 			return
 		}
 
@@ -290,7 +255,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	index, _, ok := kv.rf.Start(cmd)
 	if ok { // wait for agreement
 		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
+		for time.Now().Sub(startTime) < 1*time.Second { // waiting for agreement
 			if kv.DuplicatedMap[cmd.ID] { // success to achieve agreement
 				reply.Err = OK
 				DPrintf("[S%d] success to put/append id=%d k=%s vh=%v", kv.me, cmd.ID%SHOW_BIT, cmd.Key, cmd.Value)
@@ -304,22 +269,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// not agreement..
 		DPrintf("[FATAL%d]: APPEND_2 ID:%v key=%s v=%v at Index:%d Not Agree",
 			kv.me, args.ID%SHOW_BIT, args.Key, args.Value, index)
-		reply.Err = ErrNoKey
+		reply.Err = ErrFailAgree
 		return
 	} else {
-		startTime := time.Now()
-		for time.Now().Sub(startTime) < 2*time.Second { // waiting for agreement
-			if kv.DuplicatedMap[args.ID] { // success to sync
-				reply.Err = ErrWrongLeader
-				return
-			}
-			kv.mu.Unlock()
-			ms := 30 + rand.Int()%40
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			kv.mu.Lock()
+		if kv.DuplicatedMap[args.ID] { // success to sync
+			reply.Err = ErrWrongLeader
+			return
 		}
-		DPrintf("[S%d] Fail to agree", kv.me)
-		reply.Err = ErrNoKey
+		reply.Err = ErrFailAgree
 		return
 	}
 

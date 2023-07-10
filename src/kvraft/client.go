@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 )
+import Rn "math/rand"
 import "crypto/rand"
 import "math/big"
 
@@ -57,52 +58,77 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // use synchornous number
 // TODO, what's the consensus?
 func (ck *Clerk) Get(key string) string {
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
 	Id := nrand()
 	DPrintf("[C%d]Get Id=%v key=%s", ck.me, Id%SHOW_BIT, key)
-	st := ck.lastLeader
+	resV := NOP_String
+	var resCnt []int
+	var callMap []int
+	for i := 0; i < len(ck.servers); i++ { // init
+		resCnt = append(resCnt, 0)
+		callMap = append(callMap, 0)
+	}
+	var smu sync.Mutex
 	for {
-		resV := ""
-		resCnt := 0
+		smu.Lock()
+		st := ck.lastLeader
+		smu.Unlock()
 		for i := 0; i < len(ck.servers); i++ {
 			server := (i + st) % len(ck.servers) // got target server
-			DPrintf("[C%d]i=%d Get S=%d Id=%v", ck.me, i, server, Id%SHOW_BIT)
+			//DPrintf("[C%d]i=%d Get S=%d Id=%v", ck.me, i, server, Id%SHOW_BIT)
 			args := GetArgs{
 				Key: key,
 				ID:  Id,
 			}
 			reply := GetReply{}
-			ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
-			if ok {
-				if reply.Err == ErrWrongLeader { // continue
-					if reply.Value == "fail" {
-						DPrintf("[C%d] S=%d Not leader, not synced, cnt=%d", ck.me, server, resCnt)
-						continue
-					}
-					DPrintf("[C%d] S=%d Not leader, but synced, cnt=%d", ck.me, server, resCnt+1)
-					resCnt++
-					if resCnt*2 >= len(ck.servers) {
-						DPrintf("	[C%d]success to Get Id=%v key=%s vh=%v", ck.me, Id%SHOW_BIT, key, resV)
-						return resV
-					}
-				}
-				if reply.Err == OK || reply.Err == ErrNoKey {
-					DPrintf("[C%d] S=%d believe leader, v=%s, cnt=%d", ck.me, server, reply.Value, resCnt+1)
-					ck.lastLeader = server
-					resCnt++
-					resV = reply.Value
-					if (resCnt * 2) >= len(ck.servers) {
-						DPrintf("	[C%d]success to Get Id=%v key=%s vh=%v", ck.me, Id%SHOW_BIT, key, reply.Value)
-						return reply.Value
-					}
-				}
-			} else {
-				DPrintf("	[C%d]READ Id=%v S=%d Error, next", ck.me, Id%SHOW_BIT, server)
+			if callMap[server] == 1 { // last call not finished
 				continue
 			}
+			go func() { // start a new call
+				callMap[server] = 1
+				//DPrintf("[C%d] Get Sent Id=%v S=%d", ck.me, Id%SHOW_BIT, server)
+				ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+				callMap[server] = 0
+				if ok {
+					if reply.Err == ErrFailAgree { // leader or follower
+
+					}
+					if reply.Err == OK { // only from leader
+						smu.Lock()
+						ck.lastLeader = server
+						resCnt[server] = 1
+						resV = reply.Value
+						smu.Unlock()
+					}
+					if reply.Err == ErrNoKey { // only from leader
+						smu.Lock()
+						ck.lastLeader = server
+						resCnt[server] = 1
+						resV = ""
+						smu.Unlock()
+					}
+					if reply.Err == ErrWrongLeader { // only from follower
+						smu.Lock()
+						resCnt[server] = 1
+						smu.Unlock()
+					}
+				}
+			}()
 		}
-		time.Sleep(100 * time.Millisecond)
+		smu.Lock()
+		cur := 0
+		for i := 0; i < len(ck.servers); i++ {
+			if resCnt[i] == 1 {
+				cur++
+			}
+		}
+		if resV != NOP_String && (cur*2) >= len(ck.servers) {
+			smu.Unlock()
+			DPrintf("[C%d] Get Success Id=%v K=%s v=%s", ck.me, Id%SHOW_BIT, key, resV)
+			return resV
+		}
+		smu.Unlock()
+		ms := 10 + Rn.Int()%10
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -116,16 +142,21 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
 	Id := nrand()
 	DPrintf("[C%d]PA Id=%v key=%s vh=%v op=%s", ck.me, Id%SHOW_BIT, key, value, op)
-	for { // handler leader change
+	var resCnt []int
+	var callMap []int
+	for i := 0; i < len(ck.servers); i++ { // init
+		resCnt = append(resCnt, 0)
+		callMap = append(callMap, 0)
+	}
+	var smu sync.Mutex
+	for {
+		smu.Lock()
 		st := ck.lastLeader
-		cntV := 0
-		for i := 0; i < len(ck.servers); i++ { // handle wrong leader
+		smu.Unlock()
+		for i := 0; i < len(ck.servers); i++ {
 			server := (i + st) % len(ck.servers) // got target server
-			//DPrintf("[C%d]PA S=%d", ck.me, server)
 			args := PutAppendArgs{
 				Key:   key,
 				Value: value,
@@ -133,36 +164,48 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ID:    Id,
 			}
 			reply := PutAppendReply{}
-			ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
-			if ok {
-				if reply.Err == ErrNoKey { // Special for no agree
-					DPrintf("	[C%d]PA Id=%v S%d not leader, not syned", ck.me, Id%SHOW_BIT, server) // retry
-					continue
-				}
-				if reply.Err == ErrWrongLeader { // switch leader
-					DPrintf("	[C%d]PA Id=%v S%d not leader, but syned", ck.me, Id%SHOW_BIT, server)
-					cntV++
-					if cntV*2 >= len(ck.servers) {
-						DPrintf("	[C%d]PA Id=%v Success", ck.me, Id%SHOW_BIT)
-						return
-					}
-					continue
-				}
-				if reply.Err == OK {
-					ck.lastLeader = server
-					DPrintf("	[C%d]PA Id=%v S%d is leader, syned", ck.me, Id%SHOW_BIT, server)
-					cntV++
-					if cntV*2 >= len(ck.servers) {
-						DPrintf("	[C%d]PA Id=%v Success", ck.me, Id%SHOW_BIT)
-						return
-					}
-				}
-			} else {
-				DPrintf("	[C%d]PA Id=%v S=%d Error, next", ck.me, Id%SHOW_BIT, server)
+			if callMap[server] == 1 { // last call not finished
 				continue
 			}
+			go func() { // start a new call
+				callMap[server] = 1
+				//DPrintf("[C%d] Put/Append Sent Id=%v S=%d", ck.me, Id%SHOW_BIT, server)
+				ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+				callMap[server] = 0
+				if ok {
+					if reply.Err == OK { // ok append from leader
+						smu.Lock()
+						//DPrintf("[C%d] Put/Append OK Id=%v S=%d", ck.me, Id%SHOW_BIT, server)
+						ck.lastLeader = server
+						resCnt[server] = 1
+						smu.Unlock()
+					}
+					if reply.Err == ErrWrongLeader { // ok append from follower
+						smu.Lock()
+						//DPrintf("[C%d] Put/Append WLD Id=%v S=%d", ck.me, Id%SHOW_BIT, server)
+						resCnt[server] = 1
+						smu.Unlock()
+					}
+					if reply.Err == ErrFailAgree { // fail append from leader/follower
+						//DPrintf("[C%d] Put/Append fail agree Id=%v S=%d", ck.me, Id%SHOW_BIT, server)
+					}
+				}
+			}()
 		}
-		time.Sleep(100 * time.Millisecond)
+		smu.Lock()
+		cur := 0
+		for i := 0; i < len(ck.servers); i++ {
+			if resCnt[i] == 1 {
+				cur++
+			}
+		}
+		smu.Unlock()
+		if (cur * 2) >= len(ck.servers) {
+			DPrintf("[C%d] Put/Append Success Id=%v op=%s K=%s v=%s", ck.me, Id%SHOW_BIT, op, key, value)
+			return
+		}
+		ms := 10 + Rn.Int()%10
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
