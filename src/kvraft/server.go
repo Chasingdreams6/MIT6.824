@@ -75,9 +75,9 @@ func (kv *KVServer) MakeSnapshot() []byte {
 }
 
 func (kv *KVServer) ReadSnapshot(snapshot []byte) {
-	// TODO, if clear?
-	kv.Database = make(map[string]string)
-	kv.DuplicatedMap = make(map[int64]bool)
+
+	//kv.Database = make(map[string]string)
+	//kv.DuplicatedMap = make(map[int64]bool)
 	//kv.mu.Lock()
 	//defer kv.mu.Unlock()
 	r := bytes.NewBuffer(snapshot)
@@ -87,8 +87,8 @@ func (kv *KVServer) ReadSnapshot(snapshot []byte) {
 		DPrintf("[FATAL] DECODE error")
 		return
 	}
+	var K, V string
 	for i := 0; i < Dblen; i++ {
-		var K, V string
 		if d.Decode(&K) != nil || d.Decode(&V) != nil {
 			DPrintf("[FATAL] DECODE error")
 			return
@@ -100,8 +100,8 @@ func (kv *KVServer) ReadSnapshot(snapshot []byte) {
 		DPrintf("[FATAL] DECODE error")
 		return
 	}
+	var str string
 	for i := 0; i < Dulen; i++ {
-		var str string
 		if d.Decode(&str) != nil {
 			DPrintf("[FATAL] DECODE error")
 			return
@@ -112,7 +112,6 @@ func (kv *KVServer) ReadSnapshot(snapshot []byte) {
 			return
 		}
 		kv.DuplicatedMap[K1] = true
-		//DPrintf("S[%d] ReadSnapshot DupKey=%v", kv.me, K1)
 	}
 
 }
@@ -126,17 +125,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if isLeader == false {
 		reply.Err = ErrWrongLeader
 		if kv.DuplicatedMap[args.ID] {
-			reply.Value = kv.Database[args.Key]
 			return
 		}
 		reply.Err = ErrFailAgree
-		return
-	}
-	v := kv.DuplicatedMap[args.ID]
-	if v == true { // ok before, ignore
-		reply.Err = OK
-		reply.Value = kv.Database[args.Key]
-		DPrintf("[S%d] Ignore same READ request ID=%v", kv.me, args.ID)
 		return
 	}
 	cmd := Op{}
@@ -175,7 +166,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	} else { // for follower, wait applyMsg
 		reply.Err = ErrWrongLeader
 		if kv.DuplicatedMap[args.ID] {
-			reply.Value = kv.Database[args.Key]
 			return
 		}
 		reply.Err = ErrFailAgree
@@ -206,65 +196,59 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	cmd := Op{}
-	//if args.Op == "Put" { // put
-	cmd.Key = args.Key
-	cmd.ID = args.ID
-	cmd.Value = args.Value
-	cmd.Kind = WRITE
-	//}
+	if args.Op == "Put" { // put
+		cmd.Key = args.Key
+		cmd.ID = args.ID
+		cmd.Value = args.Value
+		cmd.Kind = WRITE
+	}
 
-	//if args.Op == "Append" { // append = get + put
-	//
-	//	RID := args.RID
-	//
-	//	cmd1 := Op{}
-	//	cmd1.ID = RID
-	//	cmd1.Key = args.Key
-	//	cmd1.Kind = READ
-	//
-	//	var v string
-	//	DPrintf("[S%d] believe leader, start agree phase1 id=%v RID:%v", kv.me, args.ID%SHOW_BIT, RID%SHOW_BIT)
-	//
-	//	_, _, ok := kv.rf.Start(cmd1)
-	//	if ok {
-	//		DPrintf("[S%d] (%v)Append, first read Id=%v key=%s", kv.me, args.ID%SHOW_BIT, cmd1.ID%SHOW_BIT, cmd1.Key)
-	//		startTime := time.Now()
-	//		for time.Now().Sub(startTime) < 1*time.Second { // waiting for agreement
-	//			if kv.DuplicatedMap[cmd1.ID] { // success to read
-	//				v, ok = kv.Database[args.Key] // ok may be false because of first empty slot
-	//				DPrintf("[S%d] leader, agree rid=%v v=%s", kv.me, cmd1.ID%SHOW_BIT, v)
-	//				goto nextLabel
-	//			}
-	//			kv.mu.Unlock()
-	//			ms := 10 + rand.Int()%10
-	//			time.Sleep(time.Duration(ms) * time.Millisecond)
-	//			kv.mu.Lock()
-	//		}
-	//		DPrintf("[S%d] leader, no agree rid=%v", kv.me, cmd1.ID%SHOW_BIT)
-	//		reply.Err = ErrFailAgree
-	//		return
-	//	} else {
-	//		if kv.DuplicatedMap[args.ID] { // success to sync
-	//			reply.Err = ErrWrongLeader
-	//			return
-	//		}
-	//		reply.Err = ErrFailAgree
-	//		return
-	//	}
-	//
-	//nextLabel:
-	//	v = v + args.Value
-	//	cmd.Key = args.Key
-	//	cmd.ID = args.ID
-	//	cmd.Value = v
-	//	cmd.Kind = WRITE
-	//}
-	//
-	//term2, isLeader2 := kv.rf.GetState()
-	//if isLeader2 == false || term2 != term { // false, wait for agree
-	//	reply.Err = ErrFailAgree
-	//	return
-	//}
+	if args.Op == "Append" { // append = get + put
+
+		RID := nrand()
+
+		cmd1 := Op{}
+		cmd1.ID = RID
+		cmd1.Key = args.Key
+		cmd1.Kind = READ
+
+		var v string
+		DPrintf("[S%d] believe leader, start agree phase1 id=%v RID:%v", kv.me, args.ID%SHOW_BIT, RID%SHOW_BIT)
+
+		_, _, ok := kv.rf.Start(cmd1)
+		if ok {
+			DPrintf("[S%d] (%v)Append, first read Id=%v key=%s", kv.me, args.ID%SHOW_BIT, cmd1.ID%SHOW_BIT, cmd1.Key)
+			startTime := time.Now()
+			for time.Now().Sub(startTime) < 1*time.Second { // waiting for agreement
+				if kv.DuplicatedMap[cmd1.ID] { // success to read
+					v, ok = kv.Database[args.Key] // ok may be false because of first empty slot
+					DPrintf("[S%d] leader, agree rid=%v", kv.me, cmd1.ID%SHOW_BIT)
+					goto nextLabel
+				}
+				kv.mu.Unlock()
+				ms := 10 + rand.Int()%10
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+				kv.mu.Lock()
+			}
+			DPrintf("[S%d] leader, no agree rid=%v", kv.me, cmd1.ID%SHOW_BIT)
+			reply.Err = ErrFailAgree
+			return
+		} else {
+			if kv.DuplicatedMap[args.ID] { // success to sync
+				reply.Err = ErrWrongLeader
+				return
+			}
+			reply.Err = ErrFailAgree
+			return
+		}
+
+	nextLabel:
+		v = v + args.Value
+		cmd.Key = args.Key
+		cmd.ID = args.ID
+		cmd.Value = v
+		cmd.Kind = WRITE
+	}
 
 	// retry
 	DPrintf("[S%d] believe leader, start agree phase2 id=%v", kv.me, args.ID%SHOW_BIT)
@@ -296,15 +280,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-}
-
-func (kv *KVServer) GCID(args *GcArgs, reply *GcReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	delete(kv.DuplicatedMap, args.Id)
-	//kv.persister.Save(kv.persister.ReadRaftState(), kv.MakeSnapshot())
-	reply.Err = OK
-	return
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -384,8 +359,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	labgob.Register(PutAppendReply{})
 	labgob.Register(GetArgs{})
 	labgob.Register(GetReply{})
-	labgob.Register(GcArgs{})
-	labgob.Register(GcReply{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -395,8 +368,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.Database = make(map[string]string)
 	kv.DuplicatedMap = make(map[int64]bool)
-	// reload snapshot...
-	kv.ReadSnapshot(persister.ReadSnapshot())
 	go kv.applier(kv.applyCh)
 	time.Sleep(10 * time.Millisecond)
 	return kv
