@@ -368,6 +368,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.Database = make(map[string]string)
 	kv.DuplicatedMap = make(map[int64]bool)
+	kv.ReadSnapshot(persister.ReadSnapshot())
 	go kv.applier(kv.applyCh)
 	time.Sleep(10 * time.Millisecond)
 	return kv
