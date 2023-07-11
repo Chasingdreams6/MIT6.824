@@ -12,7 +12,7 @@ const (
 	ErrFailAgree   = "ErrFailAgree"
 )
 
-const NOP_String = "gwioasklge-15-3&#$64"
+const NOP_String = "nop"
 const SHOW_BIT = 100000
 
 var debugStart time.Time
@@ -42,7 +42,7 @@ type PutAppendArgs struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	ID  int64
-	FID int64
+	RID int64 // id for read
 }
 
 type PutAppendReply struct {
@@ -57,4 +57,12 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type GcArgs struct {
+	Id int64
+}
+
+type GcReply struct {
+	Err Err
 }
