@@ -1,5 +1,11 @@
 package shardctrler
 
+import (
+	"fmt"
+	"log"
+	"time"
+)
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -17,8 +23,24 @@ package shardctrler
 // You will need to add fields to the RPC argument structs.
 //
 
+var Debug = true
+var debugStart time.Time
+
+func DPrintf(format string, a ...interface{}) {
+
+	if Debug {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d ", time)
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+	return
+}
+
 // The number of shards.
 const NShards = 10
+const SHOW_BIT = 10000
 
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
@@ -26,6 +48,54 @@ type Config struct {
 	Num    int              // config number
 	Shards [NShards]int     // shard -> gid
 	Groups map[int][]string // gid -> servers[]
+}
+
+// ConfigDeepCopy deep copy an config from an old config
+// the number will be old number + 1
+func ConfigDeepCopy(config1 Config) Config {
+	DPrintf("[copy] copy based on configNum=%d", config1.Num)
+	res := Config{}
+	res.Groups = make(map[int][]string)
+	res.Num = config1.Num + 1
+	for i := 0; i < NShards; i++ {
+		res.Shards[i] = config1.Shards[i]
+	}
+	for k, v := range config1.Groups {
+		// v is shared reference
+		// deep copy v to vc
+		vc := make([]string, len(v))
+		copy(vc, v)
+		res.Groups[k] = vc
+	}
+	return res
+}
+
+func ArrayToString(gids []int) string {
+	res := "Groups(gid):"
+	for _, v := range gids {
+		res += fmt.Sprintf(" %d ", v)
+	}
+	return res
+}
+
+func ServerToString(server map[int][]string) string {
+	res := "Groups(gid):"
+	for k, _ := range server {
+		res += fmt.Sprintf(" %d ", k)
+	}
+	return res
+}
+
+// ConfigToString trans an config to string for debug
+func ConfigToString(config2 Config) string {
+	res := ""
+	res += fmt.Sprintf("cfn:%d ", config2.Num)
+	res += ServerToString(config2.Groups)
+	res += "Shards:(shard->gid)"
+	for i := 0; i < NShards; i++ {
+		res += fmt.Sprintf(" %d->%d ", i, config2.Shards[i])
+	}
+	return res
 }
 
 const (
@@ -36,6 +106,7 @@ type Err string
 
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	ID      int64            // id for duplicate detection
 }
 
 type JoinReply struct {
@@ -45,6 +116,7 @@ type JoinReply struct {
 
 type LeaveArgs struct {
 	GIDs []int
+	ID   int64 // id for duplicate detection
 }
 
 type LeaveReply struct {
@@ -55,6 +127,7 @@ type LeaveReply struct {
 type MoveArgs struct {
 	Shard int
 	GID   int
+	ID    int64 // id for duplicate detection
 }
 
 type MoveReply struct {
@@ -63,7 +136,8 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num int   // desired config number
+	ID  int64 // id for duplicate detection
 }
 
 type QueryReply struct {
