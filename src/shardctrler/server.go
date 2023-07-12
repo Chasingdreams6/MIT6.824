@@ -164,33 +164,20 @@ func (sc *ShardCtrler) WaitAndApply(cmd Op) (bool, Config) {
 		startTime := time.Now()
 		for time.Now().Sub(startTime) < 2*time.Second {
 			if sc.DuplicatedMap[cmd.ID] {
-				if cmd.Kind != QueryCOMMAND { // actually change config
-					if len(sc.Configs)-1 >= cmd.ConfigX.Num { // overwrite
-						DPrintf("[sc%d]: overwrite log at index:%d config:%s", sc.me,
-							cmd.ConfigX.Num, ConfigToString(cmd.ConfigX))
-						sc.Configs[cmd.ConfigX.Num] = cmd.ConfigX
-					} else { // append
-						for len(sc.Configs) < cmd.ConfigX.Num {
-							sc.Configs = append(sc.Configs, Config{}) // append victims...
-						}
-						// here, len(sc.Configs) == cmd.ConfigX.Num
-						DPrintf("[sc%d]: append log at index:%d config:%s", sc.me,
-							len(sc.Configs), ConfigToString(cmd.ConfigX))
-						sc.Configs = append(sc.Configs, cmd.ConfigX)
-					}
-					sc.ConfigNumber++
-					//sc.persister.Save(sc.persister.ReadRaftState(), sc.MakeSnapshot())
-					return false, Config{}
-				} else { // query
+				if cmd.Kind == QueryCOMMAND { // query
 					if cmd.CId >= 0 && cmd.CId < len(sc.Configs) { // normal
+						DPrintf("[sc:%d]: id=%v read log at index:=%d config:%s", sc.me, cmd.ID%SHOW_BIT, cmd.CId, ConfigToString(sc.Configs[cmd.CId]))
 						resConfig := ConfigDeepCopy(sc.Configs[cmd.CId])
 						resConfig.Num-- // adjust for DeepCopy
 						return false, resConfig
 					} else { // read latest
+						DPrintf("[sc:%d]: id=%v read log at index:=%d config:%s LTS", sc.me, cmd.ID%SHOW_BIT, len(sc.Configs)-1, ConfigToString(sc.Configs[len(sc.Configs)-1]))
 						resConfig := ConfigDeepCopy(sc.Configs[len(sc.Configs)-1])
 						resConfig.Num--
 						return false, resConfig
 					}
+				} else {
+					return false, Config{}
 				}
 			}
 
@@ -351,9 +338,26 @@ func (sc *ShardCtrler) Applier(applyCh chan raft.ApplyMsg) {
 		if msg.CommandValid {
 			sc.mu.Lock()
 			AppliedCmd := msg.Command.(Op)
-			sc.DuplicatedMap[AppliedCmd.ID] = true
-			//sc.persister.Save(sc.persister.ReadRaftState(), sc.MakeSnapshot())
-			DPrintf("[sc:%d] Apply Cmd kind=%s id=%v", sc.me, AppliedCmd.Kind, AppliedCmd.ID%SHOW_BIT)
+			if sc.DuplicatedMap[AppliedCmd.ID] == false {
+				sc.DuplicatedMap[AppliedCmd.ID] = true
+				DPrintf("[sc:%d] Apply Cmd kind=%s id=%v", sc.me, AppliedCmd.Kind, AppliedCmd.ID%SHOW_BIT)
+				if AppliedCmd.Kind != QueryCOMMAND { // actually change config
+					if len(sc.Configs)-1 >= AppliedCmd.ConfigX.Num { // overwrite
+						DPrintf("[sc:%d]: overwrite log at index:%d config:%s", sc.me,
+							AppliedCmd.ConfigX.Num, ConfigToString(AppliedCmd.ConfigX))
+						sc.Configs[AppliedCmd.ConfigX.Num] = AppliedCmd.ConfigX
+					} else { // append
+						for len(sc.Configs) < AppliedCmd.ConfigX.Num {
+							sc.Configs = append(sc.Configs, Config{}) // append victims...
+						}
+						// here, len(sc.Configs) == cmd.ConfigX.Num
+						DPrintf("[sc:%d]: append log at index:%d config:%s", sc.me,
+							len(sc.Configs), ConfigToString(AppliedCmd.ConfigX))
+						sc.Configs = append(sc.Configs, AppliedCmd.ConfigX)
+					}
+					sc.ConfigNumber++
+				}
+			}
 			sc.mu.Unlock()
 		}
 		if msg.SnapshotValid {
