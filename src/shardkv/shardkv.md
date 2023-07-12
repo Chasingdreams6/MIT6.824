@@ -17,3 +17,7 @@
 - Move
 - Query
 
+#### shardkv
+1. A shardkv server is a member of only a single replica group.The set of servers in a given replica group will never change.
+2. A kv-server must reject client's request when the re-configuration is not finished.
+3. 

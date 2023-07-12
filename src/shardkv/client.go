@@ -62,7 +62,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
-
+	args.ID = nrand()
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -82,7 +82,7 @@ func (ck *Clerk) Get(key string) string {
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
+		// ask controller for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
 
@@ -96,8 +96,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
-
+	args.ID = nrand()
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]

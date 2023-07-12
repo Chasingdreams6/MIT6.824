@@ -52,11 +52,15 @@ type Config struct {
 
 // ConfigDeepCopy deep copy an config from an old config
 // the number will be old number + 1
-func ConfigDeepCopy(config1 Config) Config {
+func ConfigDeepCopy(config1 Config, increase bool) Config {
 	DPrintf("[copy] copy based on config=%s", ConfigToString(config1))
 	res := Config{}
 	res.Groups = make(map[int][]string)
-	res.Num = config1.Num + 1
+	if increase {
+		res.Num = config1.Num + 1
+	} else {
+		res.Num = config1.Num
+	}
 	for i := 0; i < NShards; i++ {
 		res.Shards[i] = config1.Shards[i]
 	}

@@ -168,13 +168,11 @@ func (sc *ShardCtrler) WaitAndApply(cmd Op) (bool, Config) {
 				if cmd.Kind == QueryCOMMAND { // query
 					if cmd.CId >= 0 && cmd.CId < len(sc.Configs) { // normal
 						DPrintf("[sc:%d]: id=%v read log at index:=%d config:%s", sc.me, cmd.ID%SHOW_BIT, cmd.CId, ConfigToString(sc.Configs[cmd.CId]))
-						resConfig := ConfigDeepCopy(sc.Configs[cmd.CId])
-						resConfig.Num-- // adjust for DeepCopy
+						resConfig := ConfigDeepCopy(sc.Configs[cmd.CId], false)
 						return false, resConfig
 					} else { // read latest
 						DPrintf("[sc:%d]: id=%v read log at index:=%d config:%s LTS", sc.me, cmd.ID%SHOW_BIT, len(sc.Configs)-1, ConfigToString(sc.Configs[len(sc.Configs)-1]))
-						resConfig := ConfigDeepCopy(sc.Configs[len(sc.Configs)-1])
-						resConfig.Num--
+						resConfig := ConfigDeepCopy(sc.Configs[len(sc.Configs)-1], false)
 						return false, resConfig
 					}
 				} else {
@@ -219,8 +217,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 	// the config's place is decide here.
 	// if retry, it may change another number
-	newConfig := ConfigDeepCopy(sc.Configs[sc.ConfigNumber]) // copy config
-	for k, v := range args.Servers {                         // join gid->list pairs, shadow copy here
+	newConfig := ConfigDeepCopy(sc.Configs[sc.ConfigNumber], true) // copy config
+	for k, v := range args.Servers {                               // join gid->list pairs, shadow copy here
 		newConfig.Groups[k] = v
 	}
 	newConfig.Shards = ScheduleShard(newConfig) // reschedule the shard after change groups..
@@ -254,7 +252,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}
 
 	// new config
-	newConfig := ConfigDeepCopy(sc.Configs[sc.ConfigNumber])
+	newConfig := ConfigDeepCopy(sc.Configs[sc.ConfigNumber], true)
 	// prove the gids must exist
 	for _, vic := range args.GIDs {
 		delete(newConfig.Groups, vic) // error?
@@ -290,7 +288,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	}
 
 	// new config
-	newConfig := ConfigDeepCopy(sc.Configs[sc.ConfigNumber])
+	newConfig := ConfigDeepCopy(sc.Configs[sc.ConfigNumber], true)
 	newConfig.Shards[args.Shard] = args.GID // change shard->gid
 	cmd := Op{
 		ConfigX: newConfig,
