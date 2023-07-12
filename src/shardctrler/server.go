@@ -12,6 +12,7 @@ import "6.5840/labgob"
 
 type ShardCtrler struct {
 	mu        sync.Mutex
+	wmu       sync.Mutex
 	me        int
 	rf        *raft.Raft
 	applyCh   chan raft.ApplyMsg
@@ -200,6 +201,8 @@ func (sc *ShardCtrler) WaitAndApply(cmd Op) (bool, Config) {
 // will increase a new config finally
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
+	sc.wmu.Lock()
+	defer sc.wmu.Unlock()
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
@@ -235,6 +238,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 // will increase a new config finally
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
+	sc.wmu.Lock()
+	defer sc.wmu.Unlock()
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	_, isLeader := sc.rf.GetState()
@@ -269,6 +274,8 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 // will increase a new config finally
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+	sc.wmu.Lock()
+	defer sc.wmu.Unlock()
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	_, isLeader := sc.rf.GetState()
