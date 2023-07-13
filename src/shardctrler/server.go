@@ -350,7 +350,7 @@ func (sc *ShardCtrler) Applier(applyCh chan raft.ApplyMsg) {
 					if len(sc.Configs)-1 >= AppliedCmd.ConfigX.Num { // overwrite
 						DPrintf("[sc:%d]: overwrite log at index:%d config:%s", sc.me,
 							AppliedCmd.ConfigX.Num, ConfigToString(AppliedCmd.ConfigX))
-						sc.Configs[AppliedCmd.ConfigX.Num] = AppliedCmd.ConfigX
+						sc.Configs[AppliedCmd.ConfigX.Num] = ConfigDeepCopy(AppliedCmd.ConfigX, false)
 					} else { // append
 						for len(sc.Configs) < AppliedCmd.ConfigX.Num {
 							sc.Configs = append(sc.Configs, Config{}) // append victims...
@@ -358,7 +358,7 @@ func (sc *ShardCtrler) Applier(applyCh chan raft.ApplyMsg) {
 						// here, len(sc.Configs) == cmd.ConfigX.Num
 						DPrintf("[sc:%d]: append log at index:%d config:%s", sc.me,
 							len(sc.Configs), ConfigToString(AppliedCmd.ConfigX))
-						sc.Configs = append(sc.Configs, AppliedCmd.ConfigX)
+						sc.Configs = append(sc.Configs, ConfigDeepCopy(AppliedCmd.ConfigX, false))
 					}
 					sc.ConfigNumber++
 				}

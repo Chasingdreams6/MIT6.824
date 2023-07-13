@@ -23,7 +23,7 @@ import (
 // You will need to add fields to the RPC argument structs.
 //
 
-var Debug = true
+var Debug = false
 var debugStart time.Time
 
 func DPrintf(format string, a ...interface{}) {
@@ -53,7 +53,7 @@ type Config struct {
 // ConfigDeepCopy deep copy an config from an old config
 // the number will be old number + 1
 func ConfigDeepCopy(config1 Config, increase bool) Config {
-	DPrintf("[copy] copy based on config=%s", ConfigToString(config1))
+	//DPrintf("[copy] copy based on config=%s", ConfigToString(config1))
 	res := Config{}
 	res.Groups = make(map[int][]string)
 	if increase {

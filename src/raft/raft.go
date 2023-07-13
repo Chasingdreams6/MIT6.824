@@ -20,6 +20,8 @@ package raft
 import (
 	"6.5840/labgob"
 	"bytes"
+	"reflect"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -461,7 +463,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return // no need copy next...
 		}
 		if len(args.Entries) > 0 && len(rf.Log)-1 == args.PrevLogIndex+len(args.Entries) &&
-			rf.Log[len(rf.Log)-1] == args.Entries[len(args.Entries)-1] { // skip do useless thing...
+			reflect.DeepEqual(rf.Log[len(rf.Log)-1], args.Entries[len(args.Entries)-1]) { // skip do useless thing...
 			goto compareLabel
 		}
 		if len(rf.Log) > args.PrevLogIndex+1+args.LastIncludedIndex {

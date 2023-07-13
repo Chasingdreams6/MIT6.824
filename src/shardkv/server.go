@@ -104,14 +104,61 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	_, _, ok := kv.rf.Start(cmd)
 	if ok { // wait..
-
+		reply.Err = kv.WaitForApply(cmd)
+		reply.Value = kv.Database[args.Key]
 	} else { // not the leader
-
+		reply.Err = ErrWrongLeader
 	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	reply.ID = args.ID
+	// return immediately when not the right group
+	if kv.IfRightGroup(args.Key) == false {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	if kv.DuplicateMap[args.ID] {
+		reply.Err = OK
+		return
+	}
+
+	v := ""
+	if args.Op == "Append" { // read first
+		cmd1 := Op{
+			ID:   nrand(),
+			Kind: GetCommand,
+			Key:  args.Key,
+		}
+		_, _, ok := kv.rf.Start(cmd1)
+		if ok {
+			reply.Err = kv.WaitForApply(cmd1)
+			if reply.Err != OK {
+				return
+			}
+			v = kv.Database[args.Key]
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	}
+
+	v = v + args.Value
+	cmd2 := Op{
+		ID:    args.ID,
+		Kind:  PutCommand,
+		Key:   args.Key,
+		Value: v,
+	}
+	_, _, ok := kv.rf.Start(cmd2)
+	if ok {
+		reply.Err = kv.WaitForApply(cmd2)
+	} else {
+		reply.Err = ErrWrongLeader
+	}
 }
 
 // UpdateConfig Background go-routine for update config every 100 ms
@@ -149,7 +196,12 @@ func (kv *ShardKV) Applier() {
 				if AppliedCmd.Kind == UpdateConfigCommand { // update config
 					kv.config = shardctrler.ConfigDeepCopy(AppliedCmd.ConfigX, false)
 				}
-				// TODO other command
+				if AppliedCmd.Kind == GetCommand { //
+
+				}
+				if AppliedCmd.Kind == PutCommand {
+					kv.Database[AppliedCmd.Key] = AppliedCmd.Value
+				}
 			}
 			kv.mu.Unlock()
 		} else if msg.SnapshotValid {
