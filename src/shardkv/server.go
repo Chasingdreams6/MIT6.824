@@ -4,6 +4,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/shardctrler"
 	"math/rand"
+	"reflect"
 	"time"
 )
 import "6.5840/raft"
@@ -13,15 +14,18 @@ import "6.5840/labgob"
 // Op read/put/append command consensus for raft
 // Field names must start with capital letters,
 type Op struct {
-	ID      int64              // unique id for duplicate detection
-	Key     string             // useful for read/put/append
-	Value   string             // useful for put/append
-	ConfigX shardctrler.Config // only useful for updateConfig CMD
-	Kind    CommandType
+	ID           int64              // unique id for duplicate detection
+	Key          string             // useful for read/put/append
+	Value        string             // useful for put/append
+	ConfigNumber int                // use for redo
+	ConfigX      shardctrler.Config // only useful for updateConfig CMD
+	Kind         CommandType
 }
 
 type ShardKV struct {
 	mu           sync.Mutex
+	wmu          sync.Mutex
+	onChanging   bool
 	me           int
 	rf           *raft.Raft
 	persister    *raft.Persister
@@ -97,9 +101,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	cmd := Op{
-		ID:   args.ID,
-		Kind: GetCommand,
-		Key:  args.Key,
+		ID:           args.ID,
+		Kind:         GetCommand,
+		Key:          args.Key,
+		ConfigNumber: kv.config.Num,
 	}
 
 	_, _, ok := kv.rf.Start(cmd)
@@ -113,8 +118,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.wmu.Lock()
+	defer kv.wmu.Unlock()
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	kv.onChanging = true
+	defer func() {
+		kv.onChanging = false
+	}()
 	reply.ID = args.ID
 	// return immediately when not the right group
 	if kv.IfRightGroup(args.Key) == false {
@@ -127,12 +138,14 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
+	configNumber := kv.config.Num
 	v := ""
 	if args.Op == "Append" { // read first
 		cmd1 := Op{
-			ID:   nrand(),
-			Kind: GetCommand,
-			Key:  args.Key,
+			ID:           nrand(),
+			Kind:         GetCommand,
+			Key:          args.Key,
+			ConfigNumber: configNumber,
 		}
 		_, _, ok := kv.rf.Start(cmd1)
 		if ok {
@@ -145,13 +158,18 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ErrWrongLeader
 		}
 	}
-
+	DPrintf("[s:%d gid:%d] Append(put) First read v=%s id=%v StartConfigNumber:%d Now:%d", kv.me, kv.gid, v, args.ID%SHOW_BIT, configNumber, kv.config.Num)
+	if kv.config.Num != configNumber { // config changed, fail
+		reply.Err = ErrWrongGroup
+		return
+	}
 	v = v + args.Value
 	cmd2 := Op{
-		ID:    args.ID,
-		Kind:  PutCommand,
-		Key:   args.Key,
-		Value: v,
+		ID:           args.ID,
+		Kind:         PutCommand,
+		Key:          args.Key,
+		Value:        v,
+		ConfigNumber: configNumber,
 	}
 	_, _, ok := kv.rf.Start(cmd2)
 	if ok {
@@ -170,15 +188,18 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // INsight: a read must occur after the completion of configuration and pullShards ?
 func (kv *ShardKV) UpdateConfig() {
 	for {
+		kv.mu.Lock()
 		_, isLeader := kv.rf.GetState()
 		if isLeader { // optimize of useless query
 			cmd := Op{
-				ID:      nrand(),
-				Kind:    UpdateConfigCommand,
-				ConfigX: kv.sm.Query(-1),
+				ID:           nrand(),
+				Kind:         UpdateConfigCommand,
+				ConfigX:      kv.sm.Query(-1),
+				ConfigNumber: kv.config.Num,
 			}
 			kv.rf.Start(cmd) // start issue an agreement
 		}
+		kv.mu.Unlock()
 		ms := 190 + rand.Int()%20
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -191,16 +212,27 @@ func (kv *ShardKV) Applier() {
 			AppliedCmd := msg.Command.(Op)
 			kv.mu.Lock()
 			if kv.DuplicateMap[AppliedCmd.ID] == false {
-				DPrintf("[s:%d gid:%d] Apply command kind=%s id=%v", kv.me, kv.gid, AppliedCmd.Kind, AppliedCmd.ID%SHOW_BIT)
-				kv.DuplicateMap[AppliedCmd.ID] = true
-				if AppliedCmd.Kind == UpdateConfigCommand { // update config
-					kv.config = shardctrler.ConfigDeepCopy(AppliedCmd.ConfigX, false)
-				}
-				if AppliedCmd.Kind == GetCommand { //
+				if kv.config.Num != AppliedCmd.ConfigNumber {
+					DPrintf("[s:%d gid:%d] ConfigNumber changed lst:%d now:%d, give up", kv.me, kv.gid,
+						AppliedCmd.ConfigNumber, kv.config.Num)
+				} else {
+					DPrintf("[s:%d gid:%d] Apply command kind=%s id=%v", kv.me, kv.gid, AppliedCmd.Kind, AppliedCmd.ID%SHOW_BIT)
+					kv.DuplicateMap[AppliedCmd.ID] = true
+					if AppliedCmd.Kind == UpdateConfigCommand { // update config
+						newConfig := shardctrler.ConfigDeepCopy(AppliedCmd.ConfigX, false)
+						if !reflect.DeepEqual(newConfig, kv.config) {
+							DPrintf("[s:%d gid:%d] update config old:%s", kv.me, kv.gid, shardctrler.ConfigToString(kv.config))
+							DPrintf("[s:%d gid:%d] update config new:%s", kv.me, kv.gid, shardctrler.ConfigToString(newConfig))
+							kv.PullShard(newConfig, kv.config)
+							kv.config = newConfig
+						}
+					}
+					if AppliedCmd.Kind == GetCommand { //
 
-				}
-				if AppliedCmd.Kind == PutCommand {
-					kv.Database[AppliedCmd.Key] = AppliedCmd.Value
+					}
+					if AppliedCmd.Kind == PutCommand {
+						kv.Database[AppliedCmd.Key] = AppliedCmd.Value
+					}
 				}
 			}
 			kv.mu.Unlock()
@@ -210,12 +242,89 @@ func (kv *ShardKV) Applier() {
 	}
 }
 
+func (kv *ShardKV) MergeDB(db map[string]string) {
+	for k, v := range db {
+		kv.Database[k] = v
+	}
+}
+
 // PullShard
 // if configuration changed, pull shards from other group using RPC
-// TODO how to prove pull the latest version of the target group's servers
+// TODO how to prove pull the latest version of the target group's servers.
+// only pull from leader?
 // TODO when it triggered? what's the order with put/append ?
-func (kv *ShardKV) PullShard() {
+// after config changed, then pull. The order is proved by the order of config change/
+func (kv *ShardKV) PullShard(newConfig shardctrler.Config, oldConfig shardctrler.Config) {
+	oldOwns := make(map[int]bool)
 
+	for i := 0; i < shardctrler.NShards; i++ {
+		if oldConfig.Shards[i] == kv.gid { // owned
+			oldOwns[i] = true
+		}
+	}
+	for i := 0; i < shardctrler.NShards; i++ {
+		if oldConfig.Shards[i] == 0 { // skip default shards change
+			continue
+		}
+		if newConfig.Shards[i] == kv.gid && oldOwns[i] == false { // should pull
+			// find the oldOwns of
+			oldGid := oldConfig.Shards[i]
+			for {
+				okay := false
+				DPrintf("[s:%d, gid:%d] try to pull shard from gid:%d", kv.me, kv.gid, oldGid)
+				for _, server := range oldConfig.Groups[oldGid] {
+					args := PullShardArgs{
+						Gid:   kv.gid,
+						Shard: i,
+					}
+					reply := PullShardReply{}
+					ok := kv.make_end(server).Call("ShardKV.GrantShard", &args, &reply)
+					if ok && reply.Err == OK { // only from leader...
+						okay = true
+						kv.MergeDB(reply.Database)
+						DPrintf("[s:%d, gid:%d] pull shard from gid:%d server:%s okay", kv.me, kv.gid, oldGid, server)
+					} else {
+						DPrintf("[s:%d, gid:%d] pull shard from gid:%d server:%s error:%s", kv.me, kv.gid, oldGid, server, reply.Err)
+					}
+				}
+				if okay {
+					break
+				}
+				ms := 90 + rand.Int()%20
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+			}
+		}
+	}
+}
+
+func (kv *ShardKV) GrantShard(args *PullShardArgs, reply *PullShardReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	_, isLeader := kv.rf.GetState()
+	if isLeader == false {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	if kv.onChanging { // reject when a Put/Append request is processing...
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// remove this check, because the old owner's authority may has been canceled
+
+	//if kv.config.Shards[args.Shard] != kv.gid {
+	//	DPrintf("[s:%d, gid:%d] Got pull request, but config's gid(%d) != my(%d)!", kv.me, kv.gid, kv.config.Shards[args.Shard], kv.gid)
+	//	reply.Err = ErrWrongGroup
+	//	return
+	//}
+	DPrintf("[s:%d, gid:%d] Grant Shard %d to gid:%d", kv.me, kv.gid, args.Shard, args.Gid)
+	reply.Database = make(map[string]string)
+	for k, v := range kv.Database {
+		if key2shard(k) == args.Shard {
+			reply.Database[k] = v
+		}
+	}
+	reply.Err = OK
+	return
 }
 
 // the tester calls Kill() when a ShardKV instance won't

@@ -63,6 +63,7 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
 	args.ID = nrand()
+	DPrintf("[clerk]: Get key=%s id=%v Start", key, args.ID%SHOW_BIT)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -73,6 +74,7 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					DPrintf("[clerk]: Get key=%s(shard:%d) id=%v v=%s Success", key, key2shard(key), args.ID%SHOW_BIT, reply.Value)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -97,6 +99,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Value = value
 	args.Op = op
 	args.ID = nrand()
+	DPrintf("[clerk]: PA key=%s v=%s id=%v kind=%s Start", key, value, args.ID%SHOW_BIT, op)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -106,6 +109,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					DPrintf("[clerk]: PA key=%s(shard:%d) v=%s id=%v kind=%s Success", key, key2shard(key), value, args.ID%SHOW_BIT, op)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {

@@ -48,6 +48,14 @@ func DPrintf(format string, a ...interface{}) {
 	return
 }
 
+func DeepCopyMap(db map[string]string) map[string]string {
+	res := make(map[string]string)
+	for k, v := range db {
+		res[k] = v
+	}
+	return res
+}
+
 type Err string
 
 // Put or Append
@@ -77,4 +85,14 @@ type GetReply struct {
 	Err   Err
 	Value string
 	ID    int64
+}
+
+type PullShardArgs struct {
+	Gid   int // sender's gid
+	Shard int // request shard number
+}
+
+type PullShardReply struct {
+	Err      Err
+	Database map[string]string
 }
