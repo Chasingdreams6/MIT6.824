@@ -1,8 +1,10 @@
 package shardkv
 
 import (
+	"6.5840/shardctrler"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 )
 
@@ -29,10 +31,11 @@ const (
 	PutCommand          CommandType = "Put"
 	AppendCommand       CommandType = "Append"
 	UpdateConfigCommand CommandType = "Updtcmd"
+	MergeDBCommand      CommandType = "MergeDB"
 )
 
 const Debug = true
-const SHOW_BIT = 1000
+const SHOW_BIT = 100000
 
 var debugStart time.Time
 
@@ -52,6 +55,22 @@ func DeepCopyMap(db map[string]string) map[string]string {
 	res := make(map[string]string)
 	for k, v := range db {
 		res[k] = v
+	}
+	return res
+}
+
+func DeepCopyList(ls []int) []int {
+	var res []int
+	for _, v := range ls {
+		res = append(res, v)
+	}
+	return res
+}
+
+func ListTostring(ls []int) string {
+	res := ""
+	for _, v := range ls {
+		res = res + strconv.Itoa(v) + " "
 	}
 	return res
 }
@@ -88,11 +107,34 @@ type GetReply struct {
 }
 
 type PullShardArgs struct {
-	Gid   int // sender's gid
-	Shard int // request shard number
+	Gid    int // sender's gid
+	Shard  int // request shard number
+	MyGen  int // my generation for pull
+	Server int // puller's id
 }
 
 type PullShardReply struct {
 	Err      Err
 	Database map[string]string
+}
+
+type PullDoneArgs struct {
+	Gid     int // puller's gid
+	PullGen int // oldConfig's gen
+}
+
+type PullDoneReply struct {
+	Err Err
+}
+
+type PushShardArgs struct {
+	Gid      int                // sender's gid
+	Shards   []int              // sender's shards ready to sync
+	Database map[string]string  // sender's db
+	ConfigX  shardctrler.Config // sender's newer config
+	Id       int64
+}
+
+type PushShardReply struct {
+	Err Err
 }
