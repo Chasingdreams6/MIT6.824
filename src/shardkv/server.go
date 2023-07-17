@@ -4,6 +4,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/shardctrler"
 	"bytes"
+	"fmt"
 	"math/rand"
 	"reflect"
 	"strconv"
@@ -41,10 +42,10 @@ type ShardKV struct {
 	maxraftstate int                // snapshot if log grows this big
 
 	// config
-	config shardctrler.Config
-	//// grant map
-	//grantMap [shardctrler.NShards][]int
-	pushing bool
+	config       shardctrler.Config
+	toPullMap    map[int][]int
+	pushing      bool
+	updatingFlag bool
 
 	// Your definitions here.
 	Database     map[string]string
@@ -119,7 +120,7 @@ func (kv *ShardKV) WaitForApply(op Op, t int) Err {
 		}
 		//DPrintf("[s:%d gid:%d] unlock", kv.me, kv.gid)
 		kv.mu.Unlock()
-		ms := 90 + rand.Int()%20
+		ms := 40 + rand.Int()%20
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		kv.mu.Lock()
 		//DPrintf("[s:%d gid:%d] lock", kv.me, kv.gid)
@@ -150,6 +151,12 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
+	if kv.CheckIfAllGet(kv.config.Num) == false {
+		reply.Err = ErrWrongGroup
+		DPrintf("[s:%d gid:%d] Wait version %d before Get", kv.me, kv.gid, kv.config.Num)
+		return
+	}
+
 	if kv.DuplicateMap[args.ID] {
 		reply.Err = OK
 		reply.Value = kv.Database[args.Key]
@@ -162,11 +169,17 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		Key:          args.Key,
 		ConfigNumber: kv.config.Num,
 	}
+	configNumber := kv.config.Num
 
 	_, _, ok := kv.rf.Start(cmd)
 	if ok { // wait..
 		reply.Err = kv.WaitForApply(cmd, 2)
 		reply.Value = kv.Database[args.Key]
+		// check the configNum not changed
+		if kv.config.Num != configNumber || kv.pushing ||
+			kv.CheckIfAllGet(kv.config.Num) == false || kv.IfRightGroup(args.Key) == false {
+			reply.Err = ErrWrongGroup
+		}
 	} else { // not the leader
 		reply.Err = ErrWrongLeader
 	}
@@ -192,6 +205,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// return immediately when not the right group
 	if kv.IfRightGroup(args.Key) == false {
 		reply.Err = ErrWrongGroup
+		return
+	}
+
+	if kv.CheckIfAllGet(kv.config.Num) == false {
+		reply.Err = ErrWrongGroup
+		DPrintf("[s:%d gid:%d] Wait version %d before PA", kv.me, kv.gid, kv.config.Num)
 		return
 	}
 
@@ -236,6 +255,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	_, _, ok := kv.rf.Start(cmd2)
 	if ok {
 		reply.Err = kv.WaitForApply(cmd2, 2)
+		if kv.config.Num != configNumber || kv.pushing || kv.CheckIfAllGet(kv.config.Num) == false ||
+			kv.IfRightGroup(args.Key) == false {
+			reply.Err = ErrWrongGroup
+		}
 	} else {
 		reply.Err = ErrWrongLeader
 	}
@@ -281,6 +304,7 @@ func (kv *ShardKV) Applier() {
 					kv.DuplicateMap[AppliedCmd.ID] = true
 					DPrintf("[s:%d gid:%d] Apply command kind=%s shards:%s id=%v", kv.me, kv.gid, AppliedCmd.Kind, ListTostring(AppliedCmd.Shards), AppliedCmd.ID%SHOW_BIT)
 					kv.MergeDB(AppliedCmd.Database, AppliedCmd.Shards)
+					kv.DeleteToPullMap(AppliedCmd.ConfigX.Num, AppliedCmd.Shards)
 				} else {
 					if kv.config.Num != AppliedCmd.ConfigNumber && AppliedCmd.Kind != UpdateConfigCommand {
 						DPrintf("[s:%d gid:%d] ConfigNumber changed lst:%d now:%d, give up cmd id=%v", kv.me, kv.gid,
@@ -293,15 +317,12 @@ func (kv *ShardKV) Applier() {
 							if !reflect.DeepEqual(newConfig, kv.config) { // optimize for unnecessary pull
 								DPrintf("[s:%d gid:%d] update config old:%s", kv.me, kv.gid, shardctrler.ConfigToString(kv.config))
 								DPrintf("[s:%d gid:%d] update config new:%s", kv.me, kv.gid, shardctrler.ConfigToString(newConfig))
+								kv.SetToPullMap(newConfig, kv.config) // newConfig's pull map
 								_, isLeader := kv.rf.GetState()
 								if isLeader {
-									db := DeepCopyMap(kv.Database)
+									//db := DeepCopyMap(kv.Database)
 									cfg := shardctrler.ConfigDeepCopy(kv.config, false)
-									//DPrintf("[s:%d gid:%d] unlock", kv.me, kv.gid)
-									kv.mu.Unlock()
-									kv.PushShard(newConfig, cfg, db)
-									kv.mu.Lock()
-									//DPrintf("[s:%d gid:%d] lock", kv.me, kv.gid)
+									go kv.PushShard(newConfig, cfg)
 								}
 								kv.config = newConfig
 							}
@@ -314,67 +335,130 @@ func (kv *ShardKV) Applier() {
 						}
 					}
 				}
+			} else {
+				DPrintf("[s:%d gid:%d] Duplicated cmd kind=%s id=%v", kv.me, kv.gid, AppliedCmd.Kind, AppliedCmd.ID%SHOW_BIT)
 			}
 			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate { // make snapshot
 				DPrintf("[s:%d gid:%d] Applier Make Snapshot", kv.me, kv.gid)
 				kv.rf.Snapshot(msg.CommandIndex, kv.MakeSnapshot())
 			}
-			//DPrintf("[s:%d gid:%d] unlock", kv.me, kv.gid)
 			kv.mu.Unlock()
 		} else if msg.SnapshotValid {
 			kv.mu.Lock()
-			//DPrintf("[s:%d gid:%d] lock", kv.me, kv.gid)
 			DPrintf("[s:%d gid:%d] Applier read snapshot", kv.me, kv.gid)
 			kv.ReadSnapshot(msg.Snapshot)
-			//DPrintf("[s:%d gid:%d] unlock", kv.me, kv.gid)
 			kv.mu.Unlock()
 		}
 	}
 }
 
-// PushShard use when unlocked..
-func (kv *ShardKV) PushShard(newConfig shardctrler.Config, oldConfig shardctrler.Config, copiedDB map[string]string) {
+func (kv *ShardKV) SetToPullMap(newConfig shardctrler.Config, oldConfig shardctrler.Config) {
+	for i := 0; i < shardctrler.NShards; i++ {
+		if oldConfig.Shards[i] == 0 {
+			continue
+		}
+		if newConfig.Shards[i] == kv.gid && oldConfig.Shards[i] != kv.gid {
+			kv.toPullMap[newConfig.Num] = append(kv.toPullMap[newConfig.Num], i)
+		}
+	}
+	DPrintf("[s:%d gid:%d] After set map cfn:%d map:%s", kv.me, kv.gid, newConfig.Num, ListTostring(kv.toPullMap[newConfig.Num]))
+}
+
+func (kv *ShardKV) DeleteToPullMap(cfn int, shards []int) {
+	var remain []int
+	for _, v := range kv.toPullMap[cfn] {
+		flag := false
+		for _, shard := range shards {
+			if v == shard {
+				flag = true
+				break
+			}
+		}
+		if flag == false {
+			remain = append(remain, v)
+		}
+	}
+	kv.toPullMap[cfn] = remain
+	DPrintf("[s:%d gid:%d] After delete map cfn:%d map:%s", kv.me, kv.gid, cfn, ListTostring(kv.toPullMap[cfn]))
+}
+
+// WaitUntilAllGet, wait until this kv-store
+func (kv *ShardKV) WaitUntilAllGet(cfn int) {
+	for len(kv.toPullMap[cfn]) > 0 {
+		_, isLeader := kv.rf.GetState()
+		DPrintf("[s:%d gid:%d] Waiting until get shards:%s isleader:%v", kv.me, kv.gid, ListTostring(kv.toPullMap[cfn]), isLeader)
+		kv.mu.Unlock()
+		ms := 490 + rand.Int()%20
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		kv.mu.Lock()
+	}
+	DPrintf("[s:%d gid:%d] Waiting until get shards success at cfn:%d", kv.me, kv.gid, cfn)
+}
+
+func (kv *ShardKV) CheckIfAllGet(cfn int) bool {
+	return len(kv.toPullMap[cfn]) == 0
+}
+
+// PushShard use when locked..
+func (kv *ShardKV) PushShard(newConfig shardctrler.Config, oldConfig shardctrler.Config) {
 	kv.pushing = true
 	defer func() {
 		kv.pushing = false
 	}()
 	var lostsShard []int
 	var targetGid = make(map[int][]int) // gid -> list of shards
+	var targetId = make(map[int]int64)
+	var unDoneGid = make(map[int]bool)
 	for i := 0; i < shardctrler.NShards; i++ {
 		if oldConfig.Shards[i] == kv.gid && newConfig.Shards[i] != kv.gid {
 			lostsShard = append(lostsShard, i)
 			targetGid[newConfig.Shards[i]] = append(targetGid[newConfig.Shards[i]], i)
 		}
 	}
-	//copiedDB := DeepCopyMap(kv.Database)
-	for gid, list := range targetGid {
-		copiedShards := DeepCopyList(list)
-		id := nrand()
-		for { // retry until success
-			DPrintf("[s:%d gid:%d] Try to push shards:%s to gid:%d id:%v", kv.me, kv.gid, ListTostring(list), gid, id%SHOW_BIT)
-			flag := false
+	// allocate Id for each targetGid
+	for gid, _ := range targetGid {
+		targetId[gid] = nrand()
+		unDoneGid[gid] = true
+	}
+	for len(unDoneGid) > 0 {
+		var copiedDB map[string]string
+		if kv.CheckIfAllGet(oldConfig.Num) == false {
+			DPrintf("[s:%d gid:%d] wait cfn:%d before push cfn:%d", kv.me, kv.gid, oldConfig.Num, newConfig.Num)
+			goto sleepLabel
+		}
+		// got db here
+		kv.mu.Lock()
+		copiedDB = DeepCopyMap(kv.Database)
+		kv.mu.Unlock()
+		for gid, list := range targetGid {
+			if unDoneGid[gid] == false {
+				continue
+			}
+			copiedShards := DeepCopyList(list)
+			id := targetId[gid]
+			DPrintf("[s:%d gid:%d] Try to push shards:%s to gid:%d id:%v db:%s", kv.me, kv.gid, ListTostring(list), gid, id%SHOW_BIT, kv.DBTS(copiedDB))
 			for _, server := range newConfig.Groups[gid] {
 				args := PushShardArgs{
 					Gid:      kv.gid,
 					Shards:   copiedShards,
 					Database: copiedDB,
 					Id:       id,
+					ConfigX:  newConfig,
 				}
 				reply := PushShardReply{}
-
+				//DPrintf("[s:%d gid:%d] send push shards to server %s id:%v", kv.me, kv.gid, server, id%SHOW_BIT)
 				ok := kv.make_end(server).Call("ShardKV.ReceiveShard", &args, &reply)
+				//DPrintf("[s:%d gid:%d] send push shards to server %s shards:%s result %s", kv.me, kv.gid, server, ListTostring(args.Shards), reply.Err)
 				if ok && reply.Err == OK {
-					flag = true
+					DPrintf("[s:%d gid:%d] Success to push shards:%s to gid:%d id:%v cfn:%d", kv.me, kv.gid, ListTostring(list), gid, id%SHOW_BIT, newConfig.Num)
+					delete(unDoneGid, gid)
 					break
 				}
 			}
-			if flag { // success to sync one group
-				DPrintf("[s:%d gid:%d] Success to push shards:%s to gid:%d id:%v", kv.me, kv.gid, ListTostring(list), gid, id%SHOW_BIT)
-				break
-			}
-			ms := 200 + rand.Int()%1500
-			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
+	sleepLabel:
+		ms := 200 + rand.Int()%100
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -395,13 +479,21 @@ func (kv *ShardKV) ReceiveShard(args *PushShardArgs, reply *PushShardReply) {
 	cmd := Op{
 		ID:       id,
 		Kind:     MergeDBCommand,
-		Shards:   args.Shards,
-		Database: args.Database,
+		Shards:   DeepCopyList(args.Shards),
+		Database: DeepCopyMap(args.Database),
+		ConfigX:  shardctrler.ConfigDeepCopy(args.ConfigX, false),
 	}
+	// skip if not set newConfig here
+	if len(kv.toPullMap[args.ConfigX.Num]) == 0 {
+		reply.Err = ErrWrongGroup
+		DPrintf("[s:%d gid:%d] Waiting to update config before receive shards %s", kv.me, kv.gid, ListTostring(cmd.Shards))
+		return
+	}
+
+	DPrintf("[s:%d gid:%d] Receiver start to issue cmd on shards:%s", kv.me, kv.gid, ListTostring(cmd.Shards))
 	_, _, ok := kv.rf.Start(cmd)
 	if ok { // leader
 		reply.Err = kv.WaitForApply(cmd, 2)
-		DPrintf("[s:%d gid:%d] Receive shard result %s", kv.me, kv.gid, reply.Err)
 	} else {
 		reply.Err = ErrWrongLeader
 	}
@@ -418,6 +510,14 @@ func (kv *ShardKV) Mig() {
 	}
 }
 
+func (kv *ShardKV) DBTS(db map[string]string) string {
+	res := ""
+	for k, v := range db {
+		res += fmt.Sprintf(" key=%s, v=%s ", k, v)
+	}
+	return res
+}
+
 func (kv *ShardKV) MergeDB(db map[string]string, shards []int) {
 	for k, v := range db {
 		flag := false
@@ -427,10 +527,13 @@ func (kv *ShardKV) MergeDB(db map[string]string, shards []int) {
 				break
 			}
 		}
+		//DPrintf("[s:%d gid:%d] db k=%s v=%s", kv.me, kv.gid, k, v)
 		if flag {
+			DPrintf("[s:%d gid:%d] change k=%s v=%s", kv.me, kv.gid, k, v)
 			kv.Database[k] = v
 		}
 	}
+	DPrintf("[s:%d gid:%d] After merge db: %s", kv.me, kv.gid, kv.DBTS(kv.Database))
 }
 
 func ShardsToString(sh map[int]bool) string {
@@ -655,7 +758,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.persister = persister
 	kv.Database = make(map[string]string)
 	kv.DuplicateMap = make(map[int64]bool)
-
+	kv.toPullMap = make(map[int][]int)
 	kv.ReadSnapshot(persister.ReadSnapshot())
 
 	kv.applyCh = make(chan raft.ApplyMsg)
